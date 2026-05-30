@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-backend"
+version = "0.0.1"
+description = "Sentinel dashboard backend — FastAPI reader for PinSight + DriftEdge."
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pandas>=2.2",
+    "pyarrow>=15",
+    "python-dotenv>=1.0",
+    "sse-starlette>=2.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
