@@ -8,84 +8,115 @@ Sentinel does not trade. Sentinel does not produce signals. Sentinel only shows.
 
 ## Status
 
-Pre-alpha. Skeleton + theme + a few working tabs reading live data.
+**v0.5 shipped (2026-05-31):** Two-level tabbed navigation (DASHBOARD | PINSIGHT | DRIFTEDGE | SENTINEL), Bloomberg Amber theme, Chart.js-powered equity curve and price distribution charts, system health page with per-process status, multi-trader paper-trading display. Vanilla HTML + JS served by FastAPI — no Node dependency.
 
-## Why a separate repo
+**Operationally:** the project lives at `~/dev/Sentinel/`. A launchd job auto-starts the FastAPI server on login. Open <http://127.0.0.1:8765>.
 
-Coupling the dashboard to either trading system would muddle responsibilities and make a third future system harder to add. Sentinel is the *viewing concern*, independent of any *trading concern*.
+## UI structure
+
+```
+[DASHBOARD]   home — cross-system KPIs + 3-trader equity curve
+[PINSIGHT]
+  └─ CHAIN     latest SPY chain snapshot, IV, volumes
+  └─ FLAGS     informed-flow candidates (vol/OI ≥ 1)
+  └─ LOGS      live PinSight JSONL stream
+[DRIFTEDGE]
+  └─ PAPER     3-trader race (Kelly / Equal / Vol-Wt), equity curve, open/closed positions
+  └─ MARKETS   top Polymarket markets + yes-price histogram
+  └─ BOOKS     orderbook polling liveness per market
+  └─ LOGS      live DriftEdge JSONL stream
+[SENTINEL]
+  └─ HEALTH    process status, log/data sizes, recent events
+```
+
+Auto-refresh every 5 s on every tab.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │              FastAPI backend (Python)                        │
-│  /api/pinsight/*        /api/driftedge/*    /api/logs/tail   │
-│  reads Parquet          reads Parquet       SSE log stream   │
+│  Reads Parquet from PinSight + DriftEdge data dirs;          │
+│  tails JSONL log dirs; serves /static and /api/* routes.     │
 └──────────────────┬───────────────────────────────────────────┘
                    │
-                   │ JSON / SSE
+                   │ JSON
                    │
 ┌──────────────────▼───────────────────────────────────────────┐
-│                React + Vite frontend                         │
-│  Tabs: Overview · PinSight · DriftEdge · Logs · Settings    │
-│  Theme: Bloomberg Amber (black + #ff9000)                    │
+│        Vanilla HTML + JavaScript + Chart.js (CDN)            │
+│        Bloomberg Amber theme, monospace data, 5s refresh.    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Tabs (planned)
+## Endpoints
 
-| Tab | Source | Shows |
-|---|---|---|
-| Overview | both | header KPIs from both systems; last-fetched times |
-| PinSight → Chain | PinSight `data/chains/` | latest chain snapshot, ATM IV, 25Δ skew, top-volume strikes |
-| PinSight → Flags | PinSight `data/chains/` | informed-flow candidates (vol/OI ≥ 1) |
-| PinSight → Eval | PinSight `data/` + computed | hit rate of flagged contracts vs actual closes (when populated) |
-| DriftEdge → Markets | DriftEdge `data/markets/` | top tracked markets by volume, prices, spreads |
-| DriftEdge → Paths | DriftEdge `data/books/` + computed | probability-path drift for tracked markets |
-| DriftEdge → Flow | DriftEdge `data/books/` + computed | order-book imbalance, volume z-scores (when M3 ships) |
-| DriftEdge → Signals | DriftEdge `data/signals.parquet` | logged entry/exit signals (when M5 ships) |
-| Logs | both `logs/` | live-tailing SSE stream of structured events |
-| Settings | local | data dir paths, refresh intervals |
+| Route | Returns |
+|---|---|
+| `GET /api/health` | static config + paths |
+| `GET /api/pinsight/chain` | latest PinSight chain snapshot |
+| `GET /api/pinsight/flags?top=N` | flagged contracts table |
+| `GET /api/driftedge/markets?top=N` | top DriftEdge markets by volume |
+| `GET /api/driftedge/books` | orderbook polling liveness |
+| `GET /api/driftedge/paper` | multi-trader summary (open + closed + by-trader + by-venue) |
+| `GET /api/driftedge/paper/equity-history` | per-trader equity time series for the equity-curve chart |
+| `GET /api/driftedge/price-distribution` | yes-price histogram across active markets |
+| `GET /api/sentinel/health` | system-wide health snapshot (launchd status + log/data sizes) |
+| `GET /api/logs/pinsight` | tail of PinSight JSONL events |
+| `GET /api/logs/driftedge` | tail of DriftEdge JSONL events |
+
+## Charts
+
+Powered by Chart.js via CDN (no npm). Bloomberg Amber palette:
+
+- **3-trader equity curve** — DASHBOARD and DRIFTEDGE → PAPER. Stepped line per trader (amber/cyan/pink), time on x-axis, equity on y-axis.
+- **Yes-price distribution** — DRIFTEDGE → MARKETS. Bar histogram in 0.05 bins from 0.00 to 1.00.
 
 ## Color palette
 
-Bloomberg Amber (locked):
-
 ```
-Background:  #0a0a0a
-Primary:     #ff9000  (Bloomberg orange)
+Background:  #0a0a0a   (near-black)
+Cards:       #111111
+Primary:     #ff9000   (Bloomberg amber)
 Text:        #ffffff
-Positive:    #00ff88  (terminal green)
-Negative:    #ff4444  (terminal red)
+Positive:    #00ff88   (terminal green)
+Negative:    #ff4444   (terminal red)
 Muted:       #666666
-Border:      #1a1a1a
+
+Trader chart colors:
+  Kelly:     #ff9000   (amber)
+  Equal-Wt:  #00d4ff   (cyan)
+  Vol-Wt:    #ff66cc   (pink-magenta)
 ```
 
-Font stack: JetBrains Mono for data, system-ui for headers. Monospace everywhere it's a number.
+Symbology consistency: currency always `$X.XX`, percentages always `+/-X.XXX%`, prediction prices `0.XXX`, positive green, negative red, muted on absent.
 
 ## Configuration
 
 `.env` (see `.env.example`):
 ```
-PINSIGHT_DATA_DIR=/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/data
-PINSIGHT_LOG_DIR=/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/logs
-DRIFTEDGE_DATA_DIR=/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/data
-DRIFTEDGE_LOG_DIR=/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/logs
+PINSIGHT_DATA_DIR=/Users/tanishkyadav/dev/PinSight/data
+PINSIGHT_LOG_DIR=/Users/tanishkyadav/dev/PinSight/logs
+DRIFTEDGE_DATA_DIR=/Users/tanishkyadav/dev/DriftEdge/data
+DRIFTEDGE_LOG_DIR=/Users/tanishkyadav/dev/DriftEdge/logs
 SENTINEL_PORT=8765
 ```
 
 ## Running
 
+Manually:
 ```
-cd backend && pip install -e .
-python -m sentinel.server
-# Backend on :8765
-
-cd frontend && npm install && npm run dev
-# Frontend on :5173 (dev) — proxies /api to :8765
+cd ~/dev/Sentinel/backend
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/python -m sentinel.server
 ```
 
-To auto-start on login: `./scripts/launchd/install.sh` (requires Full Disk Access granted to bash per the PinSight/DriftEdge prerequisite).
+Then open <http://127.0.0.1:8765>.
+
+Auto-start on login:
+```
+./scripts/launchd/install.sh
+```
 
 ## Repo layout
 
@@ -99,28 +130,20 @@ Sentinel/
 │   └── src/sentinel/
 │       ├── __init__.py
 │       ├── config.py
-│       ├── server.py            FastAPI app + routes
-│       └── readers/             Parquet + log readers
-├── frontend/
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── index.html
-│   ├── src/
-│   │   ├── main.tsx
-│   │   ├── App.tsx
-│   │   ├── theme.css           Bloomberg Amber palette + base styles
-│   │   ├── components/
-│   │   └── tabs/
-└── scripts/launchd/
+│       ├── server.py        FastAPI app + routes
+│       ├── readers.py       Parquet + log readers (all per-route logic)
+│       └── static/          index.html, theme.css, app.js (the dashboard)
+├── frontend/                React + Vite version (built later; vanilla is shipped)
+└── scripts/launchd/         install.sh, uninstall.sh, plist
 ```
 
 ## Roadmap
 
-- **v0.1 — skeleton + Overview tab + PinSight Chain tab + Logs tab**
-- **v0.2 — DriftEdge Markets tab live, refresh-on-poll**
-- **v0.3 — Path drift charts (DriftEdge Paths tab)**
-- **v0.4 — Eval hit-rate chart (PinSight Eval tab)**
-- **v0.5 — Signals tab when DriftEdge M5 ships**
+- **v0.5 (shipped)** two-level tabs, multi-trader race view, equity curve, health page, price distribution chart
+- **v0.6** IV smile chart on PinSight CHAIN; vol/OI distribution chart on FLAGS
+- **v0.7** drawdown panel per trader; cumulative P&L chart
+- **v0.8** SSE log streaming (replace polling); searchable log filter
+- **v1.0** React version (when there's a clear reason to migrate)
 
 ## License
 

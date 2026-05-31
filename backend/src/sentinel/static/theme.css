@@ -31,9 +31,18 @@ a:hover { color: var(--primary-2); }
 .brand { font-family: var(--mono); font-weight: 700; font-size: 14px; color: var(--primary); letter-spacing: 0.05em; }
 
 .tabs { display: flex; background: var(--bg-2); border-bottom: 1px solid var(--border-2); padding: 0 8px; }
-.tab { padding: 8px 16px; background: transparent; border: none; color: var(--muted); font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; border-bottom: 2px solid transparent; transition: color 120ms, border-color 120ms; }
+.tab { padding: 10px 24px; background: transparent; border: none; color: var(--muted); font-family: var(--mono); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; cursor: pointer; border-bottom: 3px solid transparent; transition: color 120ms, border-color 120ms; }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+.subtabs { display: flex; background: var(--bg); border-bottom: 1px solid var(--border); padding: 0 16px; min-height: 30px; }
+.subtab { padding: 6px 14px; background: transparent; border: none; color: var(--muted); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; border-bottom: 2px solid transparent; }
+.subtab:hover { color: var(--text); }
+.subtab.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+.chart-wrap { position: relative; height: 320px; padding: 8px; }
+.chart-wrap.tall { height: 420px; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
 
 .content { flex: 1; overflow: auto; padding: 16px; }
 

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import os
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -272,6 +274,157 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
         "open": [_row(r) for _, r in open_df.iterrows()],
         "closed": [_row(r) for _, r in closed_df.sort_values(
             "exit_ts", ascending=False).head(30).iterrows()],
+    }
+
+
+def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
+    """Compute equity time series per trader from closed trades.
+
+    Equity(t) = bankroll_init + sum of pnl_usd for closed trades with
+    exit_ts <= t. Open positions are not marked to market in this
+    minimal version; the curve steps each time a trade closes.
+    """
+    trades_path = data_dir / "paper_trades.parquet"
+    state_path = data_dir / "paper_state.parquet"
+    if not trades_path.exists():
+        return {"status": "no_data"}
+    try:
+        df = pd.read_parquet(trades_path)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty or "trader" not in df.columns:
+        return {"status": "no_data"}
+
+    bankrolls: dict[str, float] = {}
+    if state_path.exists():
+        try:
+            st = pd.read_parquet(state_path)
+            for _, r in st.iterrows():
+                bankrolls[str(r["trader"])] = float(r["bankroll_init"])
+        except Exception:
+            pass
+
+    closed = df[df["status"] != "open"].copy()
+    series: dict[str, list[dict[str, Any]]] = {}
+    for trader in sorted(df["trader"].fillna("?").unique()):
+        bank = bankrolls.get(trader, 10000.0)
+        t_closed = closed[closed["trader"] == trader].copy()
+        # Always seed with bankroll at min trade entry time (or now if none)
+        seed_ts = df[df["trader"] == trader]["entry_ts"].min()
+        if seed_ts is None or pd.isna(seed_ts):
+            seed_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        points = [{"ts": str(seed_ts), "equity": round(bank, 2)}]
+
+        if not t_closed.empty:
+            t_closed = t_closed.sort_values("exit_ts")
+            running = bank
+            for _, r in t_closed.iterrows():
+                running += float(r.get("pnl_usd") or 0.0)
+                points.append({"ts": str(r.get("exit_ts")),
+                               "equity": round(running, 2)})
+
+        series[trader] = points
+
+    return {"status": "ok", "series": series,
+            "bankrolls": bankrolls or {"kelly": 10000, "equal": 10000, "volwt": 10000}}
+
+
+def driftedge_price_distribution(data_dir: Path) -> dict[str, Any]:
+    """Histogram of yes_price across the latest markets snapshot."""
+    markets_root = data_dir / "markets" / "polymarket"
+    p = _latest_file(markets_root) if markets_root.exists() else None
+    if p is None:
+        return {"status": "no_data"}
+    df = pd.read_parquet(p)
+    if "_snapshot_ts" in df.columns:
+        df = df[df["_snapshot_ts"] == df["_snapshot_ts"].max()]
+    prices = df["yes_price"].dropna().tolist()
+    bins = [i / 20 for i in range(21)]  # 0.00..1.00 in 0.05 steps
+    counts = [0] * (len(bins) - 1)
+    for v in prices:
+        for i in range(len(bins) - 1):
+            if bins[i] <= v < bins[i + 1] or (i == len(bins) - 2 and v == 1.0):
+                counts[i] += 1
+                break
+    return {
+        "status": "ok",
+        "bins": bins,
+        "counts": counts,
+        "total": len(prices),
+    }
+
+
+def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
+                    driftedge_data: Path, driftedge_logs: Path,
+                    sentinel_logs: Path) -> dict[str, Any]:
+    """System-wide health snapshot."""
+
+    def _dir_size_mb(d: Path) -> float:
+        if not d.exists():
+            return 0.0
+        total = 0
+        for root, _, files in os.walk(d):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return round(total / 1024 / 1024, 2)
+
+    def _launchd_status(label: str) -> dict[str, Any]:
+        try:
+            out = subprocess.check_output(
+                ["launchctl", "list"], text=True, timeout=3)
+            for line in out.splitlines():
+                if label in line:
+                    parts = line.split("\t")
+                    pid_s = parts[0] if parts else "-"
+                    exit_s = parts[1] if len(parts) > 1 else "-"
+                    return {"loaded": True,
+                            "pid": None if pid_s == "-" else int(pid_s),
+                            "last_exit_code": int(exit_s) if exit_s.lstrip("-").isdigit() else None}
+        except Exception:
+            pass
+        return {"loaded": False, "pid": None, "last_exit_code": None}
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    def _today_log_size(log_dir: Path) -> float:
+        if not log_dir.exists():
+            return 0.0
+        total = 0
+        for p in log_dir.glob(f"*-{today}.jsonl"):
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return round(total / 1024 / 1024, 3)
+
+    return {
+        "status": "ok",
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "pinsight": {
+            "data_size_mb": _dir_size_mb(pinsight_data),
+            "log_size_today_mb": _today_log_size(pinsight_logs),
+            "launchd": {
+                "morning": _launchd_status("com.tanishk.pinsight.morning"),
+                "midday": _launchd_status("com.tanishk.pinsight.midday"),
+                "close": _launchd_status("com.tanishk.pinsight.close"),
+            },
+        },
+        "driftedge": {
+            "data_size_mb": _dir_size_mb(driftedge_data),
+            "log_size_today_mb": _today_log_size(driftedge_logs),
+            "launchd": {
+                "poll": _launchd_status("com.tanishk.driftedge.poll"),
+            },
+        },
+        "sentinel": {
+            "log_size_today_mb": _today_log_size(sentinel_logs),
+            "launchd": {
+                "server": _launchd_status("com.tanishk.sentinel"),
+            },
+        },
     }
 
 

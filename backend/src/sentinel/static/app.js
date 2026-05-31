@@ -1,31 +1,60 @@
-// Sentinel vanilla JS frontend
-// Single-page tabbed dashboard. Polls /api/* every 5s.
+// Sentinel vanilla JS frontend — two-level tab structure + Chart.js charts
+//
+// Top-level:  DASHBOARD | PINSIGHT | DRIFTEDGE | SENTINEL
+// Sub-level:  per-section navigation under each top tab
+// Auto-refresh: every 5s
 
-const TABS = [
-  { id: "overview",   label: "OVERVIEW",            render: renderOverview },
-  { id: "ps-chain",   label: "PINSIGHT · CHAIN",    render: renderPSChain },
-  { id: "ps-flags",   label: "PINSIGHT · FLAGS",    render: renderPSFlags },
-  { id: "de-markets", label: "DRIFTEDGE · MARKETS", render: renderDEMarkets },
-  { id: "de-books",   label: "DRIFTEDGE · BOOKS",   render: renderDEBooks },
-  { id: "de-paper",   label: "DRIFTEDGE · PAPER",   render: renderDEPaper },
-  { id: "logs-pin",   label: "LOGS · PINSIGHT",     render: () => renderLogs("pinsight") },
-  { id: "logs-de",    label: "LOGS · DRIFTEDGE",    render: () => renderLogs("driftedge") },
+const TOP_TABS = [
+  { id: "dashboard", label: "DASHBOARD" },
+  { id: "pinsight",  label: "PINSIGHT" },
+  { id: "driftedge", label: "DRIFTEDGE" },
+  { id: "sentinel",  label: "SENTINEL" },
 ];
 
-let activeTab = "overview";
+const SUB_TABS = {
+  pinsight: [
+    { id: "chain", label: "CHAIN", render: renderPSChain },
+    { id: "flags", label: "FLAGS", render: renderPSFlags },
+    { id: "logs",  label: "LOGS",  render: () => renderLogs("pinsight") },
+  ],
+  driftedge: [
+    { id: "paper",   label: "PAPER",   render: renderDEPaper },
+    { id: "markets", label: "MARKETS", render: renderDEMarkets },
+    { id: "books",   label: "BOOKS",   render: renderDEBooks },
+    { id: "logs",    label: "LOGS",    render: () => renderLogs("driftedge") },
+  ],
+  sentinel: [
+    { id: "health", label: "HEALTH", render: renderSEHealth },
+  ],
+};
+
+let activeTop = "dashboard";
+let activeSub = { pinsight: "chain", driftedge: "paper", sentinel: "health" };
 let refreshTimer = null;
+let chartRegistry = {};
+
+const TRADER_COLORS = {
+  kelly: "#ff9000",
+  equal: "#00d4ff",
+  volwt: "#ff66cc",
+};
+const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT" };
+const TRADER_DESC = {
+  kelly: "Quarter-Kelly · p=0.45",
+  equal: "Fixed 2% per trade",
+  volwt: "Inverse-σ weighted",
+};
 
 function init() {
-  const tabsEl = document.getElementById("tabs");
-  TABS.forEach((t) => {
+  const topTabsEl = document.getElementById("top-tabs");
+  TOP_TABS.forEach(t => {
     const b = document.createElement("button");
-    b.className = "tab" + (t.id === activeTab ? " active" : "");
+    b.className = "tab" + (t.id === activeTop ? " active" : "");
     b.textContent = t.label;
-    b.onclick = () => { activeTab = t.id; rerender(); };
-    tabsEl.appendChild(b);
+    b.onclick = () => { activeTop = t.id; rerender(); };
+    topTabsEl.appendChild(b);
   });
 
-  // Clock
   const clock = document.getElementById("clock");
   setInterval(() => {
     clock.textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + "Z";
@@ -37,14 +66,36 @@ function init() {
 }
 
 function rerender() {
-  document.querySelectorAll(".tab").forEach((el, i) => {
-    el.classList.toggle("active", TABS[i].id === activeTab);
+  document.querySelectorAll("#top-tabs .tab").forEach((el, i) => {
+    el.classList.toggle("active", TOP_TABS[i].id === activeTop);
   });
-  const tab = TABS.find((t) => t.id === activeTab);
-  if (tab) tab.render();
-}
 
-// ──────────────── helpers ────────────────
+  const subTabsEl = document.getElementById("sub-tabs");
+  subTabsEl.innerHTML = "";
+  const subs = SUB_TABS[activeTop];
+  if (subs) {
+    subs.forEach(s => {
+      const b = document.createElement("button");
+      b.className = "subtab" + (s.id === activeSub[activeTop] ? " active" : "");
+      b.textContent = s.label;
+      b.onclick = () => { activeSub[activeTop] = s.id; rerender(); };
+      subTabsEl.appendChild(b);
+    });
+    subTabsEl.style.display = "";
+  } else {
+    subTabsEl.style.display = "none";
+  }
+
+  Object.values(chartRegistry).forEach(c => { try { c.destroy(); } catch (e) {} });
+  chartRegistry = {};
+
+  if (activeTop === "dashboard") {
+    renderDashboard();
+  } else {
+    const sub = subs.find(s => s.id === activeSub[activeTop]);
+    if (sub) sub.render();
+  }
+}
 
 async function jget(path) {
   const r = await fetch(path);
@@ -59,15 +110,22 @@ function set(html) {
 function fmt(n, digits = 2) {
   if (n == null || isNaN(n)) return "—";
   return Number(n).toLocaleString(undefined, {
-    minimumFractionDigits: digits, maximumFractionDigits: digits
+    minimumFractionDigits: digits, maximumFractionDigits: digits,
   });
 }
-
 function fmtInt(n) {
   if (n == null) return "—";
   return Math.round(n).toLocaleString();
 }
-
+function signClass(v) {
+  if (v == null) return "muted";
+  return v > 0 ? "pos" : v < 0 ? "neg" : "muted";
+}
+function signFmt(v, d = 2) {
+  if (v == null) return "—";
+  const sign = v >= 0 ? "+" : "";
+  return sign + fmt(v, d);
+}
 function kpi(label, value, sub) {
   return `<div class="card"><div class="kpi-label">${label}</div>
     <div class="kpi-value">${value ?? "—"}</div>
@@ -75,56 +133,146 @@ function kpi(label, value, sub) {
   </div>`;
 }
 
-// ──────────────── tabs ────────────────
+const CHART_BASE = {
+  responsive: true,
+  maintainAspectRatio: false,
+  interaction: { mode: "index", intersect: false },
+  plugins: {
+    legend: {
+      labels: {
+        color: "#ffffff",
+        font: { family: "JetBrains Mono, monospace", size: 11 },
+      },
+    },
+    tooltip: {
+      backgroundColor: "#111111",
+      titleColor: "#ff9000",
+      bodyColor: "#ffffff",
+      borderColor: "#2a2a2a",
+      borderWidth: 1,
+    },
+  },
+  scales: {
+    x: {
+      ticks: { color: "#666666", font: { family: "JetBrains Mono, monospace", size: 10 } },
+      grid: { color: "#1a1a1a" },
+    },
+    y: {
+      ticks: { color: "#666666", font: { family: "JetBrains Mono, monospace", size: 10 } },
+      grid: { color: "#1a1a1a" },
+    },
+  },
+};
 
-async function renderOverview() {
+function mkChart(canvasId, config) {
+  const el = document.getElementById(canvasId);
+  if (!el) return null;
+  const ctx = el.getContext("2d");
+  const chart = new Chart(ctx, config);
+  chartRegistry[canvasId] = chart;
+  return chart;
+}
+
+async function renderDashboard() {
   try {
-    const [chain, flags, markets, books] = await Promise.all([
+    const [paper, eq, chain, markets, health] = await Promise.all([
+      jget("/api/driftedge/paper"),
+      jget("/api/driftedge/paper/equity-history"),
       jget("/api/pinsight/chain"),
-      jget("/api/pinsight/flags?top=5"),
       jget("/api/driftedge/markets?top=5"),
-      jget("/api/driftedge/books"),
+      jget("/api/sentinel/health"),
     ]);
+
+    const s = paper.summary || {};
+    const t = s.by_trader || {};
     const ps = chain?.status === "ok";
+
     set(`
-      <div class="grid grid-6">
-        ${kpi("PinSight · Chain", ps ? chain.contracts : "—", ps ? `${chain.underlying} · ${chain.expiry}` : "")}
-        ${kpi("PinSight · Underlying", ps ? `$${fmt(chain.underlying_price)}` : "—")}
-        ${kpi("PinSight · Flags", flags?.count ?? "—")}
-        ${kpi("DriftEdge · Markets", markets?.count ?? "—", markets?.snapshot_ts?.slice(11, 19) ?? "")}
-        ${kpi("DriftEdge · Books", books?.count ?? "—")}
-        ${kpi("System", "<span class='pos'>● LIVE</span>", "auto-refresh 5s")}
+      <div class="grid grid-4" style="margin-bottom:16px">
+        ${kpi("PinSight chain", ps ? chain.contracts : "—",
+              ps ? `${chain.underlying} · ${chain.expiry}` : "(no chain yet)")}
+        ${kpi("Spot", ps ? `$${fmt(chain.underlying_price)}` : "—")}
+        ${kpi("DriftEdge polling",
+              health.driftedge.launchd.poll.loaded ? "ACTIVE" : "STOPPED",
+              `${health.driftedge.data_size_mb} MB archived`)}
+        ${kpi("Paper trades", s.total_trades ?? 0,
+              `${s.open_count ?? 0} open · ${s.closed_count ?? 0} closed`)}
       </div>
-      <div class="grid grid-2" style="margin-top:16px">
-        <div class="card">
-          <div class="card-title">PINSIGHT TOP FLAGS</div>
-          ${(flags?.items ?? []).slice(0, 5).map(f => `
-            <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
-              <span class="${f.type === 'put' ? 'neg' : 'pos'}">${f.type} ${fmt(f.strike, 0)}</span>
-              <span class="amber">${f.v_over_oi}x</span>
-            </div>`).join('') || '<div class="muted">No flags</div>'}
-        </div>
-        <div class="card">
-          <div class="card-title">DRIFTEDGE TOP MARKETS</div>
-          ${(markets?.items ?? []).slice(0, 5).map(m => `
-            <div style="padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
-              <div style="display:flex;justify-content:space-between">
-                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px">${m.question}</span>
-                <span class="amber">${fmt(m.yes_price, 3)}</span>
-              </div>
-            </div>`).join('') || '<div class="muted">No markets</div>'}
-        </div>
-      </div>`);
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">3-TRADER EQUITY CURVE · $10,000 BANKROLL EACH</div>
+        <div class="chart-wrap tall"><canvas id="equityChart"></canvas></div>
+      </div>
+
+      <div class="grid grid-3" style="margin-bottom:16px">
+        ${["kelly", "equal", "volwt"].map(id => {
+          const x = t[id] || {};
+          const ret = x.return_pct;
+          const retClass = signClass(ret);
+          return `<div class="card">
+            <div class="card-title" style="color:${TRADER_COLORS[id]}">${TRADER_LABELS[id]}</div>
+            <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[id]}</div>
+            <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
+            <div class="muted mono" style="font-size:10px">Return · Equity $${fmt(x.total_equity ?? 0, 2)}</div>
+          </div>`;
+        }).join("")}
+      </div>
+
+      <div class="card">
+        <div class="card-title">DRIFTEDGE TOP 5 MARKETS</div>
+        ${(markets.items || []).slice(0, 5).map(m => `
+          <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%">${m.question}</span>
+            <span><span class="pos">${fmt(m.yes_price, 3)}</span> · <span class="amber">$${fmtInt(m.volume_24h)}</span></span>
+          </div>`).join("") || '<div class="muted">No data.</div>'}
+      </div>
+    `);
+
+    drawEquityChart("equityChart", eq);
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
+}
+
+function drawEquityChart(canvasId, eq) {
+  if (eq.status !== "ok") return;
+  const datasets = [];
+  for (const trader of ["kelly", "equal", "volwt"]) {
+    const series = eq.series[trader];
+    if (!series || !series.length) continue;
+    datasets.push({
+      label: TRADER_LABELS[trader],
+      data: series.map(p => ({ x: p.ts, y: p.equity })),
+      borderColor: TRADER_COLORS[trader],
+      backgroundColor: TRADER_COLORS[trader] + "33",
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      stepped: "before",
+      tension: 0,
+    });
+  }
+  mkChart(canvasId, {
+    type: "line",
+    data: { datasets },
+    options: {
+      ...CHART_BASE,
+      scales: {
+        x: { ...CHART_BASE.scales.x, type: "time",
+             time: { unit: "hour", displayFormats: { hour: "MMM-d HH:mm" }}},
+        y: { ...CHART_BASE.scales.y,
+             ticks: { ...CHART_BASE.scales.y.ticks,
+                      callback: v => "$" + v.toLocaleString() }},
+      },
+    },
+  });
 }
 
 async function renderPSChain() {
   try {
     const d = await jget("/api/pinsight/chain");
     if (d.status !== "ok") {
-      set(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code>.</div>`);
+      set(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code> or wait for Monday 9:35 ET.</div>`);
       return;
     }
     set(`
@@ -159,7 +307,7 @@ async function renderPSFlags() {
     }
     set(`
       <div class="muted mono" style="margin-bottom:12px">
-        ${d.count} flagged contracts (vol/OI ≥ 1, volume ≥ 1000) — sorted by vol/OI desc
+        ${d.count} flagged contracts (vol/OI ≥ 1, volume ≥ 1000)
       </div>
       <table>
         <thead><tr>
@@ -185,14 +333,142 @@ async function renderPSFlags() {
   }
 }
 
+async function renderDEPaper() {
+  try {
+    const [d, eq] = await Promise.all([
+      jget("/api/driftedge/paper"),
+      jget("/api/driftedge/paper/equity-history"),
+    ]);
+    if (d.status !== "ok") {
+      set(`<div class="muted">No paper trades yet.</div>`);
+      return;
+    }
+    const s = d.summary;
+    const TRADERS = ["kelly", "equal", "volwt"];
+
+    const traderCards = TRADERS.map(t => {
+      const x = s.by_trader?.[t] || {};
+      const ret = x.return_pct;
+      const retClass = signClass(ret);
+      const pnlClass = signClass(x.closed_pnl);
+      const ddClass = (x.drawdown_pct ?? 0) > 5 ? "neg" : "muted";
+      return `<div class="card">
+        <div class="card-title" style="color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
+        <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[t]}</div>
+        <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
+        <div class="muted mono" style="font-size:10px;margin-top:4px">Total return</div>
+        <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-family:var(--mono);font-size:11px">
+          <div><span class="muted">Equity:</span> <span class="amber">$${fmt(x.total_equity ?? 0, 2)}</span></div>
+          <div><span class="muted">Cash:</span> <span>$${fmt(x.cash_usd ?? 0, 2)}</span></div>
+          <div><span class="muted">Open exp:</span> <span>$${fmt(x.open_exposure ?? 0, 2)}</span></div>
+          <div><span class="muted">Closed PnL:</span> <span class="${pnlClass}">$${signFmt(x.closed_pnl ?? 0, 2)}</span></div>
+          <div><span class="muted">Open:</span> <span>${x.open_count ?? 0}</span></div>
+          <div><span class="muted">Closed:</span> <span>${x.closed_count ?? 0}</span></div>
+          <div><span class="muted">W/L:</span> <span>${x.wins ?? 0} / ${x.losses ?? 0}</span></div>
+          <div><span class="muted">Hit rate:</span> <span>${x.hit_rate != null ? (x.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
+          <div><span class="muted">Avg size:</span> <span>$${fmt(x.avg_size ?? 0, 2)}</span></div>
+          <div><span class="muted">Drawdown:</span> <span class="${ddClass}">${signFmt(-(x.drawdown_pct ?? 0), 2)}%</span></div>
+        </div>
+      </div>`;
+    }).join("");
+
+    set(`
+      <div class="grid grid-3" style="margin-bottom:16px">${traderCards}</div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">EQUITY CURVE · 3-TRADER HORSE RACE</div>
+        <div class="chart-wrap tall"><canvas id="paperEquityChart"></canvas></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
+        ${d.open.length ? `<table>
+          <thead><tr>
+            <th>Trader</th><th>Venue</th><th>Question</th>
+            <th class="r">Entry</th><th class="r">Size</th>
+            <th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th>
+          </tr></thead>
+          <tbody>${d.open.map(r => `<tr>
+            <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
+            <td class="muted" style="font-size:10px">${r.venue}</td>
+            <td class="ell" style="max-width:240px">${r.question ?? ''}</td>
+            <td class="r amber">${fmt(r.entry_price, 3)}</td>
+            <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
+            <td class="r pos">${fmt(r.target, 2)}</td>
+            <td class="r neg">${fmt(r.stop, 2)}</td>
+            <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<div class="muted">No open positions.</div>'}
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">EXIT REASONS (all traders)</div>
+          ${Object.entries(s.exit_reasons || {}).map(([k, v]) =>
+            `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
+              <span class="amber">${k}</span><span>${v}</span>
+            </div>`).join('') || '<div class="muted">No closed trades yet.</div>'}
+        </div>
+        <div class="card">
+          <div class="card-title">CONFIG</div>
+          <div style="font-family:var(--mono);font-size:11px;line-height:1.7">
+            <div><span class="muted">Bankroll / trader:</span> <span class="amber">$10,000</span></div>
+            <div><span class="muted">Per-position cap:</span> <span>2% = $200</span></div>
+            <div><span class="muted">Aggregate cap:</span> <span>50% = $5,000</span></div>
+            <div><span class="muted">Min trade:</span> <span>$5</span></div>
+            <div><span class="muted">Entry zone:</span> <span>[0.30, 0.40] <span class="muted">(hardcoded)</span></span></div>
+            <div><span class="muted">Target / Stop:</span> <span class="pos">0.60</span> / <span class="neg">0.20</span></div>
+            <div><span class="muted">Force-exit:</span> <span>6h before resolution</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">CLOSED POSITIONS (most recent 30, all traders)</div>
+        ${d.closed.length ? `<table>
+          <thead><tr>
+            <th>Trader</th><th>Venue</th><th>Question</th>
+            <th class="r">Entry</th><th class="r">Exit</th><th class="r">Size</th>
+            <th>Reason</th><th class="r">P&L</th>
+          </tr></thead>
+          <tbody>${d.closed.map(r => {
+            const cls = signClass(r.pnl_usd);
+            return `<tr>
+              <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
+              <td class="muted" style="font-size:10px">${r.venue}</td>
+              <td class="ell" style="max-width:220px">${r.question ?? ''}</td>
+              <td class="r">${fmt(r.entry_price, 3)}</td>
+              <td class="r">${r.exit_price != null ? fmt(r.exit_price, 3) : '—'}</td>
+              <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
+              <td class="amber">${r.exit_reason ?? ''}</td>
+              <td class="r ${cls}">${r.pnl_usd != null ? '$' + signFmt(r.pnl_usd, 2) : '—'}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>` : '<div class="muted">No closed trades yet.</div>'}
+      </div>`);
+
+    drawEquityChart("paperEquityChart", eq);
+  } catch (e) {
+    set(`<div class="neg">Error: ${e.message}</div>`);
+  }
+}
+
 async function renderDEMarkets() {
   try {
-    const d = await jget("/api/driftedge/markets?top=50");
+    const [d, dist] = await Promise.all([
+      jget("/api/driftedge/markets?top=50"),
+      jget("/api/driftedge/price-distribution"),
+    ]);
     if (d.status !== "ok") {
       set(`<div class="muted">No DriftEdge data yet.</div>`);
       return;
     }
     set(`
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">YES-PRICE DISTRIBUTION · ${dist.total ?? 0} markets</div>
+        <div class="chart-wrap"><canvas id="priceDistChart"></canvas></div>
+      </div>
+
       <div class="muted mono" style="margin-bottom:12px">
         Snapshot: ${d.snapshot_ts ?? "—"} · ${d.count} markets · sorted by 24h volume
       </div>
@@ -212,6 +488,23 @@ async function renderDEMarkets() {
           </tr>`).join('')}
         </tbody>
       </table>`);
+
+    if (dist.status === "ok") {
+      mkChart("priceDistChart", {
+        type: "bar",
+        data: {
+          labels: dist.bins.slice(0, -1).map(b => b.toFixed(2)),
+          datasets: [{
+            label: "Market count",
+            data: dist.counts,
+            backgroundColor: "#ff900088",
+            borderColor: "#ff9000",
+            borderWidth: 1,
+          }],
+        },
+        options: CHART_BASE,
+      });
+    }
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
@@ -221,7 +514,7 @@ async function renderDEBooks() {
   try {
     const d = await jget("/api/driftedge/books");
     if (d.status !== "ok" || !d.items?.length) {
-      set(`<div class="muted">No orderbook snapshots yet. Start the DriftEdge poll daemon.</div>`);
+      set(`<div class="muted">No orderbook snapshots yet.</div>`);
       return;
     }
     set(`
@@ -249,145 +542,64 @@ async function renderDEBooks() {
   }
 }
 
-function signClass(v) {
-  if (v == null) return "muted";
-  return v > 0 ? "pos" : v < 0 ? "neg" : "muted";
-}
-function signFmt(v, d = 2) {
-  if (v == null) return "—";
-  const sign = v >= 0 ? "+" : "";
-  return sign + fmt(v, d);
-}
-
-async function renderDEPaper() {
+async function renderSEHealth() {
   try {
-    const d = await jget("/api/driftedge/paper");
-    if (d.status !== "ok") {
-      set(`<div class="muted">No paper trades yet. The poll daemon opens them automatically when markets enter the [0.30, 0.40] zone.</div>`);
+    const h = await jget("/api/sentinel/health");
+    if (h.status !== "ok") {
+      set(`<div class="neg">Health endpoint returned ${h.status}</div>`);
       return;
     }
-    const s = d.summary;
-    const TRADERS = ["kelly", "equal", "volwt"];
-    const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT" };
-    const TRADER_DESC = {
-      kelly: "Quarter-Kelly · p=0.45",
-      equal: "Fixed 2% per trade",
-      volwt: "Inverse-σ weighted",
+    const statusPill = (loaded, pid) => {
+      if (loaded && pid) return `<span class="pos">● RUNNING (pid ${pid})</span>`;
+      if (loaded) return `<span class="amber">● LOADED (idle)</span>`;
+      return `<span class="neg">● NOT LOADED</span>`;
     };
 
-    const traderCards = TRADERS.map(t => {
-      const x = s.by_trader?.[t] || {};
-      const ret = x.return_pct;
-      const retClass = signClass(ret);
-      const pnlClass = signClass(x.closed_pnl);
-      const ddClass = (x.drawdown_pct ?? 0) > 5 ? "neg" : "muted";
-      return `<div class="card">
-        <div class="card-title">${TRADER_LABELS[t]}</div>
-        <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[t]}</div>
-        <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
-        <div class="muted mono" style="font-size:10px;margin-top:4px">Total return</div>
-        <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-family:var(--mono);font-size:11px">
-          <div><span class="muted">Equity:</span> <span class="amber">$${fmt(x.total_equity ?? 0, 2)}</span></div>
-          <div><span class="muted">Cash:</span> <span>$${fmt(x.cash_usd ?? 0, 2)}</span></div>
-          <div><span class="muted">Open exp:</span> <span>$${fmt(x.open_exposure ?? 0, 2)}</span></div>
-          <div><span class="muted">Closed PnL:</span> <span class="${pnlClass}">$${signFmt(x.closed_pnl ?? 0, 2)}</span></div>
-          <div><span class="muted">Open:</span> <span>${x.open_count ?? 0}</span></div>
-          <div><span class="muted">Closed:</span> <span>${x.closed_count ?? 0}</span></div>
-          <div><span class="muted">Wins/Loss:</span> <span>${x.wins ?? 0} / ${x.losses ?? 0}</span></div>
-          <div><span class="muted">Hit rate:</span> <span>${x.hit_rate != null ? (x.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
-          <div><span class="muted">Avg size:</span> <span>$${fmt(x.avg_size ?? 0, 2)}</span></div>
-          <div><span class="muted">Drawdown:</span> <span class="${ddClass}">${signFmt(-(x.drawdown_pct ?? 0), 2)}%</span></div>
-        </div>
-      </div>`;
-    }).join("");
-
-    const venueRows = Object.entries(s.by_venue || {}).map(([v, vs]) => {
-      const cls = signClass(vs.pnl_usd);
-      return `<tr>
-        <td class="amber">${v.toUpperCase()}</td>
-        <td class="r">${vs.total}</td>
-        <td class="r">${vs.open}</td>
-        <td class="r">${vs.closed}</td>
-        <td class="r">${vs.hit_rate != null ? (vs.hit_rate * 100).toFixed(1) + '%' : '—'}</td>
-        <td class="r ${cls}">$${signFmt(vs.pnl_usd, 2)}</td>
-      </tr>`;
-    }).join('');
+    const ps = h.pinsight, de = h.driftedge, se = h.sentinel;
 
     set(`
       <div class="grid grid-3" style="margin-bottom:16px">
-        ${traderCards}
-      </div>
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-title">BY VENUE (across all traders)</div>
-        ${venueRows ? `<table>
-          <thead><tr><th>Venue</th><th class="r">Total</th><th class="r">Open</th><th class="r">Closed</th><th class="r">Hit rate</th><th class="r">P&L</th></tr></thead>
-          <tbody>${venueRows}</tbody>
-        </table>` : '<div class="muted">No venues with trades yet.</div>'}
-      </div>
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
-        ${d.open.length ? `<table>
-          <thead><tr>
-            <th>Trader</th><th>Venue</th><th>Question</th>
-            <th class="r">Entry</th><th class="r">Size</th>
-            <th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th>
-          </tr></thead>
-          <tbody>${d.open.map(r => `<tr>
-            <td class="amber">${(r.trader || '—').toUpperCase()}</td>
-            <td class="muted" style="font-size:10px">${r.venue}</td>
-            <td class="ell" style="max-width:240px">${r.question ?? ''}</td>
-            <td class="r amber">${fmt(r.entry_price, 3)}</td>
-            <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
-            <td class="r pos">${fmt(r.target, 2)}</td>
-            <td class="r neg">${fmt(r.stop, 2)}</td>
-            <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
-          </tr>`).join('')}</tbody>
-        </table>` : '<div class="muted">No open positions.</div>'}
-      </div>
-      <div class="grid grid-2" style="margin-bottom:16px">
         <div class="card">
-          <div class="card-title">EXIT REASONS (all traders)</div>
-          ${Object.entries(s.exit_reasons || {}).map(([k, v]) =>
-            `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
-              <span class="amber">${k}</span><span>${v}</span>
-            </div>`).join('') || '<div class="muted">No closed trades yet.</div>'}
+          <div class="card-title">PINSIGHT</div>
+          <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
+            <div>Morning: ${statusPill(ps.launchd.morning.loaded, ps.launchd.morning.pid)}</div>
+            <div>Midday: ${statusPill(ps.launchd.midday.loaded, ps.launchd.midday.pid)}</div>
+            <div>Close: ${statusPill(ps.launchd.close.loaded, ps.launchd.close.pid)}</div>
+            <div style="margin-top:8px"><span class="muted">Data:</span> ${ps.data_size_mb} MB</div>
+            <div><span class="muted">Logs today:</span> ${ps.log_size_today_mb} MB</div>
+          </div>
         </div>
         <div class="card">
-          <div class="card-title">CONFIG</div>
-          <div style="font-family:var(--mono);font-size:11px;line-height:1.7">
-            <div><span class="muted">Bankroll / trader:</span> <span class="amber">$10,000</span></div>
-            <div><span class="muted">Per-position cap:</span> <span>2% = $200</span></div>
-            <div><span class="muted">Aggregate cap:</span> <span>50% = $5,000</span></div>
-            <div><span class="muted">Min trade:</span> <span>$5</span></div>
-            <div><span class="muted">Entry zone:</span> <span>[0.30, 0.40]</span></div>
-            <div><span class="muted">Target / Stop:</span> <span class="pos">0.60</span> / <span class="neg">0.20</span></div>
-            <div><span class="muted">Force-exit:</span> <span>6h before resolution</span></div>
+          <div class="card-title">DRIFTEDGE</div>
+          <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
+            <div>Poll: ${statusPill(de.launchd.poll.loaded, de.launchd.poll.pid)}</div>
+            <div style="margin-top:8px"><span class="muted">Data:</span> ${de.data_size_mb} MB</div>
+            <div><span class="muted">Logs today:</span> ${de.log_size_today_mb} MB</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">SENTINEL</div>
+          <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
+            <div>Server: ${statusPill(se.launchd.server.loaded, se.launchd.server.pid)}</div>
+            <div style="margin-top:8px"><span class="muted">Logs today:</span> ${se.log_size_today_mb} MB</div>
+            <div><span class="muted">Snapshot:</span> ${h.ts}</div>
           </div>
         </div>
       </div>
+
       <div class="card">
-        <div class="card-title">CLOSED POSITIONS (most recent 30, all traders)</div>
-        ${d.closed.length ? `<table>
-          <thead><tr>
-            <th>Trader</th><th>Venue</th><th>Question</th>
-            <th class="r">Entry</th><th class="r">Exit</th><th class="r">Size</th>
-            <th>Reason</th><th class="r">P&L</th>
-          </tr></thead>
-          <tbody>${d.closed.map(r => {
-            const cls = signClass(r.pnl_usd);
-            return `<tr>
-              <td class="amber">${(r.trader || '—').toUpperCase()}</td>
-              <td class="muted" style="font-size:10px">${r.venue}</td>
-              <td class="ell" style="max-width:220px">${r.question ?? ''}</td>
-              <td class="r">${fmt(r.entry_price, 3)}</td>
-              <td class="r">${r.exit_price != null ? fmt(r.exit_price, 3) : '—'}</td>
-              <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
-              <td class="amber">${r.exit_reason ?? ''}</td>
-              <td class="r ${cls}">${r.pnl_usd != null ? '$' + signFmt(r.pnl_usd, 2) : '—'}</td>
-            </tr>`;
-          }).join('')}</tbody>
-        </table>` : '<div class="muted">No closed trades yet.</div>'}
+        <div class="card-title">RECENT DRIFTEDGE EVENTS</div>
+        <div id="recentLogs" class="logs"><span class="muted">Loading…</span></div>
       </div>`);
+
+    const log = await jget("/api/logs/driftedge?max_lines=50");
+    const events = (log.events ?? []).reverse();
+    const html = events.map(e => `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
+      <span class="log-ts">${e.ts?.slice(11, 23)}</span>
+      <span class="log-channel">${e.channel}</span>
+      <span class="log-kind">${e.kind}</span>
+    </div>`).join("");
+    document.getElementById("recentLogs").innerHTML = html || '<span class="muted">No events.</span>';
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
@@ -395,8 +607,8 @@ async function renderDEPaper() {
 
 async function renderLogs(source) {
   try {
-    const d = await jget(`/api/logs/${source}?max_lines=200`);
-    const events = d.events ?? [];
+    const d = await jget(`/api/logs/${source}?max_lines=300`);
+    const events = (d.events ?? []).reverse();
     if (!events.length) {
       set(`<div class="muted">No log events today for ${source}.</div>`);
       return;
@@ -407,8 +619,12 @@ async function renderLogs(source) {
         .map(([k, v]) => `<span class="log-field">${k}=<b>${
           typeof v === 'object' ? JSON.stringify(v) : String(v)
         }</b></span>`).join(' ');
-      return `<div class="log-line log-${(e.level ?? "info").toLowerCase()}"><span class="log-ts">${e.ts?.slice(11, 23)}</span><span class="log-channel">${e.channel}</span><span class="log-kind">${e.kind}</span>${fields}</div>`;
-    }).reverse().join('');
+      return `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
+        <span class="log-ts">${e.ts?.slice(11, 23)}</span>
+        <span class="log-channel">${e.channel}</span>
+        <span class="log-kind">${e.kind}</span>${fields}
+      </div>`;
+    }).join("");
     set(`<div class="card"><div class="logs">${html}</div></div>`);
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);

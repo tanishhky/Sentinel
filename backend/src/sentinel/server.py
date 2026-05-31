@@ -72,6 +72,22 @@ def create_app() -> FastAPI:
     def driftedge_paper():
         return readers.driftedge_paper_trades(c.driftedge_data)
 
+    @app.get("/api/driftedge/paper/equity-history")
+    def driftedge_equity_history():
+        return readers.driftedge_equity_history(c.driftedge_data)
+
+    @app.get("/api/driftedge/price-distribution")
+    def driftedge_price_distribution():
+        return readers.driftedge_price_distribution(c.driftedge_data)
+
+    @app.get("/api/sentinel/health")
+    def sentinel_health_endpoint():
+        return readers.sentinel_health(
+            c.pinsight_data, c.pinsight_logs,
+            c.driftedge_data, c.driftedge_logs,
+            Path("/Users/tanishkyadav/dev/Sentinel/logs"),
+        )
+
     @app.get("/api/logs/pinsight")
     def logs_pinsight(max_lines: int = 200):
         return {"events": readers.tail_log_dir(c.pinsight_logs, max_lines)}
