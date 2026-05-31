@@ -2,7 +2,7 @@
 # Sentinel server entrypoint for launchd.
 set -euo pipefail
 
-PROJECT="/Users/tanishkyadav/Documents/SecondBrain/GitHub/Sentinel"
+PROJECT="/Users/tanishkyadav/dev/Sentinel"
 PY="${PROJECT}/backend/.venv/bin/python"
 
 cd "$PROJECT/backend"

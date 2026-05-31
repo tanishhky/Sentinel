@@ -68,6 +68,10 @@ def create_app() -> FastAPI:
     def driftedge_books():
         return readers.driftedge_active_books(c.driftedge_data)
 
+    @app.get("/api/driftedge/paper")
+    def driftedge_paper():
+        return readers.driftedge_paper_trades(c.driftedge_data)
+
     @app.get("/api/logs/pinsight")
     def logs_pinsight(max_lines: int = 200):
         return {"events": readers.tail_log_dir(c.pinsight_logs, max_lines)}

@@ -7,6 +7,7 @@ const TABS = [
   { id: "ps-flags",   label: "PINSIGHT · FLAGS",    render: renderPSFlags },
   { id: "de-markets", label: "DRIFTEDGE · MARKETS", render: renderDEMarkets },
   { id: "de-books",   label: "DRIFTEDGE · BOOKS",   render: renderDEBooks },
+  { id: "de-paper",   label: "DRIFTEDGE · PAPER",   render: renderDEPaper },
   { id: "logs-pin",   label: "LOGS · PINSIGHT",     render: () => renderLogs("pinsight") },
   { id: "logs-de",    label: "LOGS · DRIFTEDGE",    render: () => renderLogs("driftedge") },
 ];
@@ -243,6 +244,68 @@ async function renderDEBooks() {
           </tr>`).join('')}
         </tbody>
       </table>`);
+  } catch (e) {
+    set(`<div class="neg">Error: ${e.message}</div>`);
+  }
+}
+
+async function renderDEPaper() {
+  try {
+    const d = await jget("/api/driftedge/paper");
+    if (d.status !== "ok") {
+      set(`<div class="muted">No paper trades yet. The poll daemon opens them automatically when markets enter the [0.30, 0.40] zone.</div>`);
+      return;
+    }
+    const s = d.summary;
+    const pnlClass = s.total_pnl_usd > 0 ? "pos" : s.total_pnl_usd < 0 ? "neg" : "muted";
+    const avgClass = s.avg_pnl_per_trade > 0 ? "pos" : s.avg_pnl_per_trade < 0 ? "neg" : "muted";
+    set(`
+      <div class="grid grid-6" style="margin-bottom:16px">
+        ${kpi("Total trades", s.total_trades)}
+        ${kpi("Open", s.open_count)}
+        ${kpi("Closed", s.closed_count)}
+        ${kpi("Hit rate", s.hit_rate != null ? (s.hit_rate * 100).toFixed(1) + '%' : '—')}
+        ${kpi("Total P&L", `<span class="${pnlClass}">$${fmt(s.total_pnl_usd, 2)}</span>`)}
+        ${kpi("Avg/trade", s.avg_pnl_per_trade != null ? `<span class="${avgClass}">$${fmt(s.avg_pnl_per_trade, 2)}</span>` : '—')}
+      </div>
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
+          ${d.open.length ? `<table>
+            <thead><tr><th>Question</th><th class="r">Entry</th><th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th></tr></thead>
+            <tbody>${d.open.map(r => `<tr>
+              <td class="ell" style="max-width:300px">${r.question ?? ''}</td>
+              <td class="r amber">${fmt(r.entry_price, 3)}</td>
+              <td class="r pos">${fmt(r.target, 2)}</td>
+              <td class="r neg">${fmt(r.stop, 2)}</td>
+              <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
+            </tr>`).join('')}</tbody>
+          </table>` : '<div class="muted">No open positions.</div>'}
+        </div>
+        <div class="card">
+          <div class="card-title">EXIT REASONS</div>
+          ${Object.entries(s.exit_reasons || {}).map(([k, v]) =>
+            `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
+              <span class="amber">${k}</span><span>${v}</span>
+            </div>`).join('') || '<div class="muted">No closed trades yet.</div>'}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">CLOSED POSITIONS (most recent 30)</div>
+        ${d.closed.length ? `<table>
+          <thead><tr><th>Question</th><th class="r">Entry</th><th class="r">Exit</th><th>Reason</th><th class="r">P&L</th></tr></thead>
+          <tbody>${d.closed.map(r => {
+            const cls = r.pnl_usd > 0 ? "pos" : r.pnl_usd < 0 ? "neg" : "muted";
+            return `<tr>
+              <td class="ell" style="max-width:340px">${r.question ?? ''}</td>
+              <td class="r">${fmt(r.entry_price, 3)}</td>
+              <td class="r">${r.exit_price != null ? fmt(r.exit_price, 3) : '—'}</td>
+              <td class="amber">${r.exit_reason ?? ''}</td>
+              <td class="r ${cls}">${r.pnl_usd != null ? '$' + fmt(r.pnl_usd, 2) : '—'}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>` : '<div class="muted">No closed trades yet.</div>'}
+      </div>`);
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }

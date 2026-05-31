@@ -7,11 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/Sentinel/scripts/sentinel-server.sh</string>
+        <string>/Users/tanishkyadav/dev/Sentinel/scripts/sentinel-server.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/Sentinel/backend</string>
+    <string>/Users/tanishkyadav/dev/Sentinel/backend</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -25,9 +25,9 @@
     <integer>30</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/Sentinel/logs/sentinel.out</string>
+    <string>/Users/tanishkyadav/dev/Sentinel/logs/sentinel.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/Sentinel/logs/sentinel.err</string>
+    <string>/Users/tanishkyadav/dev/Sentinel/logs/sentinel.err</string>
 
     <key>EnvironmentVariables</key>
     <dict>

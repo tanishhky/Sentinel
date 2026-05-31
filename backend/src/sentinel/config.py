@@ -25,19 +25,19 @@ def load() -> Config:
     return Config(
         pinsight_data=Path(os.getenv(
             "PINSIGHT_DATA_DIR",
-            "/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/data"
+            "/Users/tanishkyadav/dev/PinSight/data"
         )).resolve(),
         pinsight_logs=Path(os.getenv(
             "PINSIGHT_LOG_DIR",
-            "/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/logs"
+            "/Users/tanishkyadav/dev/PinSight/logs"
         )).resolve(),
         driftedge_data=Path(os.getenv(
             "DRIFTEDGE_DATA_DIR",
-            "/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/data"
+            "/Users/tanishkyadav/dev/DriftEdge/data"
         )).resolve(),
         driftedge_logs=Path(os.getenv(
             "DRIFTEDGE_LOG_DIR",
-            "/Users/tanishkyadav/Documents/SecondBrain/GitHub/DriftEdge/logs"
+            "/Users/tanishkyadav/dev/DriftEdge/logs"
         )).resolve(),
         host=os.getenv("SENTINEL_HOST", "127.0.0.1"),
         port=int(os.getenv("SENTINEL_PORT", "8765")),

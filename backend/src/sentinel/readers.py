@@ -137,6 +137,68 @@ def driftedge_top_markets(data_dir: Path, top: int = 30) -> dict[str, Any]:
     }
 
 
+def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
+    """Read paper_trades.parquet and summarize open + closed positions."""
+    path = data_dir / "paper_trades.parquet"
+    if not path.exists():
+        return {"status": "no_data"}
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty:
+        return {"status": "no_data"}
+
+    open_df = df[df["status"] == "open"]
+    closed_df = df[df["status"] != "open"]
+
+    summary = {
+        "total_trades": len(df),
+        "open_count": len(open_df),
+        "closed_count": len(closed_df),
+        "wins": int((closed_df["pnl_usd"] > 0).sum()) if not closed_df.empty else 0,
+        "losses": int((closed_df["pnl_usd"] <= 0).sum()) if not closed_df.empty else 0,
+        "hit_rate": (
+            round(float((closed_df["pnl_usd"] > 0).mean()), 3)
+            if not closed_df.empty else None
+        ),
+        "total_pnl_usd": (
+            round(float(closed_df["pnl_usd"].fillna(0).sum()), 2)
+            if not closed_df.empty else 0.0
+        ),
+        "avg_pnl_per_trade": (
+            round(float(closed_df["pnl_usd"].fillna(0).mean()), 2)
+            if not closed_df.empty else None
+        ),
+        "exit_reasons": (
+            closed_df["exit_reason"].value_counts().to_dict()
+            if not closed_df.empty else {}
+        ),
+    }
+
+    def _row(r) -> dict:
+        return {
+            "trade_id": r.get("trade_id"),
+            "question": r.get("question"),
+            "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
+            "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
+            "target": round(float(r["target"]), 3) if pd.notna(r.get("target")) else None,
+            "stop": round(float(r["stop"]), 3) if pd.notna(r.get("stop")) else None,
+            "status": r.get("status"),
+            "exit_price": round(float(r["exit_price"]), 4) if pd.notna(r.get("exit_price")) else None,
+            "exit_reason": r.get("exit_reason"),
+            "pnl_usd": round(float(r["pnl_usd"]), 2) if pd.notna(r.get("pnl_usd")) else None,
+        }
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "open": [_row(r) for _, r in open_df.iterrows()],
+        "closed": [_row(r) for _, r in closed_df.sort_values(
+            "exit_ts", ascending=False).head(30).iterrows()],
+    }
+
+
 def driftedge_active_books(data_dir: Path) -> dict[str, Any]:
     """Count of orderbook Parquets per market — a liveness signal."""
     books_root = data_dir / "books" / "polymarket"
