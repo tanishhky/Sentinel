@@ -249,6 +249,16 @@ async function renderDEBooks() {
   }
 }
 
+function signClass(v) {
+  if (v == null) return "muted";
+  return v > 0 ? "pos" : v < 0 ? "neg" : "muted";
+}
+function signFmt(v, d = 2) {
+  if (v == null) return "—";
+  const sign = v >= 0 ? "+" : "";
+  return sign + fmt(v, d);
+}
+
 async function renderDEPaper() {
   try {
     const d = await jget("/api/driftedge/paper");
@@ -257,51 +267,123 @@ async function renderDEPaper() {
       return;
     }
     const s = d.summary;
-    const pnlClass = s.total_pnl_usd > 0 ? "pos" : s.total_pnl_usd < 0 ? "neg" : "muted";
-    const avgClass = s.avg_pnl_per_trade > 0 ? "pos" : s.avg_pnl_per_trade < 0 ? "neg" : "muted";
+    const TRADERS = ["kelly", "equal", "volwt"];
+    const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT" };
+    const TRADER_DESC = {
+      kelly: "Quarter-Kelly · p=0.45",
+      equal: "Fixed 2% per trade",
+      volwt: "Inverse-σ weighted",
+    };
+
+    const traderCards = TRADERS.map(t => {
+      const x = s.by_trader?.[t] || {};
+      const ret = x.return_pct;
+      const retClass = signClass(ret);
+      const pnlClass = signClass(x.closed_pnl);
+      const ddClass = (x.drawdown_pct ?? 0) > 5 ? "neg" : "muted";
+      return `<div class="card">
+        <div class="card-title">${TRADER_LABELS[t]}</div>
+        <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[t]}</div>
+        <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
+        <div class="muted mono" style="font-size:10px;margin-top:4px">Total return</div>
+        <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-family:var(--mono);font-size:11px">
+          <div><span class="muted">Equity:</span> <span class="amber">$${fmt(x.total_equity ?? 0, 2)}</span></div>
+          <div><span class="muted">Cash:</span> <span>$${fmt(x.cash_usd ?? 0, 2)}</span></div>
+          <div><span class="muted">Open exp:</span> <span>$${fmt(x.open_exposure ?? 0, 2)}</span></div>
+          <div><span class="muted">Closed PnL:</span> <span class="${pnlClass}">$${signFmt(x.closed_pnl ?? 0, 2)}</span></div>
+          <div><span class="muted">Open:</span> <span>${x.open_count ?? 0}</span></div>
+          <div><span class="muted">Closed:</span> <span>${x.closed_count ?? 0}</span></div>
+          <div><span class="muted">Wins/Loss:</span> <span>${x.wins ?? 0} / ${x.losses ?? 0}</span></div>
+          <div><span class="muted">Hit rate:</span> <span>${x.hit_rate != null ? (x.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
+          <div><span class="muted">Avg size:</span> <span>$${fmt(x.avg_size ?? 0, 2)}</span></div>
+          <div><span class="muted">Drawdown:</span> <span class="${ddClass}">${signFmt(-(x.drawdown_pct ?? 0), 2)}%</span></div>
+        </div>
+      </div>`;
+    }).join("");
+
+    const venueRows = Object.entries(s.by_venue || {}).map(([v, vs]) => {
+      const cls = signClass(vs.pnl_usd);
+      return `<tr>
+        <td class="amber">${v.toUpperCase()}</td>
+        <td class="r">${vs.total}</td>
+        <td class="r">${vs.open}</td>
+        <td class="r">${vs.closed}</td>
+        <td class="r">${vs.hit_rate != null ? (vs.hit_rate * 100).toFixed(1) + '%' : '—'}</td>
+        <td class="r ${cls}">$${signFmt(vs.pnl_usd, 2)}</td>
+      </tr>`;
+    }).join('');
+
     set(`
-      <div class="grid grid-6" style="margin-bottom:16px">
-        ${kpi("Total trades", s.total_trades)}
-        ${kpi("Open", s.open_count)}
-        ${kpi("Closed", s.closed_count)}
-        ${kpi("Hit rate", s.hit_rate != null ? (s.hit_rate * 100).toFixed(1) + '%' : '—')}
-        ${kpi("Total P&L", `<span class="${pnlClass}">$${fmt(s.total_pnl_usd, 2)}</span>`)}
-        ${kpi("Avg/trade", s.avg_pnl_per_trade != null ? `<span class="${avgClass}">$${fmt(s.avg_pnl_per_trade, 2)}</span>` : '—')}
+      <div class="grid grid-3" style="margin-bottom:16px">
+        ${traderCards}
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">BY VENUE (across all traders)</div>
+        ${venueRows ? `<table>
+          <thead><tr><th>Venue</th><th class="r">Total</th><th class="r">Open</th><th class="r">Closed</th><th class="r">Hit rate</th><th class="r">P&L</th></tr></thead>
+          <tbody>${venueRows}</tbody>
+        </table>` : '<div class="muted">No venues with trades yet.</div>'}
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
+        ${d.open.length ? `<table>
+          <thead><tr>
+            <th>Trader</th><th>Venue</th><th>Question</th>
+            <th class="r">Entry</th><th class="r">Size</th>
+            <th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th>
+          </tr></thead>
+          <tbody>${d.open.map(r => `<tr>
+            <td class="amber">${(r.trader || '—').toUpperCase()}</td>
+            <td class="muted" style="font-size:10px">${r.venue}</td>
+            <td class="ell" style="max-width:240px">${r.question ?? ''}</td>
+            <td class="r amber">${fmt(r.entry_price, 3)}</td>
+            <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
+            <td class="r pos">${fmt(r.target, 2)}</td>
+            <td class="r neg">${fmt(r.stop, 2)}</td>
+            <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<div class="muted">No open positions.</div>'}
       </div>
       <div class="grid grid-2" style="margin-bottom:16px">
         <div class="card">
-          <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
-          ${d.open.length ? `<table>
-            <thead><tr><th>Question</th><th class="r">Entry</th><th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th></tr></thead>
-            <tbody>${d.open.map(r => `<tr>
-              <td class="ell" style="max-width:300px">${r.question ?? ''}</td>
-              <td class="r amber">${fmt(r.entry_price, 3)}</td>
-              <td class="r pos">${fmt(r.target, 2)}</td>
-              <td class="r neg">${fmt(r.stop, 2)}</td>
-              <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
-            </tr>`).join('')}</tbody>
-          </table>` : '<div class="muted">No open positions.</div>'}
-        </div>
-        <div class="card">
-          <div class="card-title">EXIT REASONS</div>
+          <div class="card-title">EXIT REASONS (all traders)</div>
           ${Object.entries(s.exit_reasons || {}).map(([k, v]) =>
             `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px">
               <span class="amber">${k}</span><span>${v}</span>
             </div>`).join('') || '<div class="muted">No closed trades yet.</div>'}
         </div>
+        <div class="card">
+          <div class="card-title">CONFIG</div>
+          <div style="font-family:var(--mono);font-size:11px;line-height:1.7">
+            <div><span class="muted">Bankroll / trader:</span> <span class="amber">$10,000</span></div>
+            <div><span class="muted">Per-position cap:</span> <span>2% = $200</span></div>
+            <div><span class="muted">Aggregate cap:</span> <span>50% = $5,000</span></div>
+            <div><span class="muted">Min trade:</span> <span>$5</span></div>
+            <div><span class="muted">Entry zone:</span> <span>[0.30, 0.40]</span></div>
+            <div><span class="muted">Target / Stop:</span> <span class="pos">0.60</span> / <span class="neg">0.20</span></div>
+            <div><span class="muted">Force-exit:</span> <span>6h before resolution</span></div>
+          </div>
+        </div>
       </div>
       <div class="card">
-        <div class="card-title">CLOSED POSITIONS (most recent 30)</div>
+        <div class="card-title">CLOSED POSITIONS (most recent 30, all traders)</div>
         ${d.closed.length ? `<table>
-          <thead><tr><th>Question</th><th class="r">Entry</th><th class="r">Exit</th><th>Reason</th><th class="r">P&L</th></tr></thead>
+          <thead><tr>
+            <th>Trader</th><th>Venue</th><th>Question</th>
+            <th class="r">Entry</th><th class="r">Exit</th><th class="r">Size</th>
+            <th>Reason</th><th class="r">P&L</th>
+          </tr></thead>
           <tbody>${d.closed.map(r => {
-            const cls = r.pnl_usd > 0 ? "pos" : r.pnl_usd < 0 ? "neg" : "muted";
+            const cls = signClass(r.pnl_usd);
             return `<tr>
-              <td class="ell" style="max-width:340px">${r.question ?? ''}</td>
+              <td class="amber">${(r.trader || '—').toUpperCase()}</td>
+              <td class="muted" style="font-size:10px">${r.venue}</td>
+              <td class="ell" style="max-width:220px">${r.question ?? ''}</td>
               <td class="r">${fmt(r.entry_price, 3)}</td>
               <td class="r">${r.exit_price != null ? fmt(r.exit_price, 3) : '—'}</td>
+              <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
               <td class="amber">${r.exit_reason ?? ''}</td>
-              <td class="r ${cls}">${r.pnl_usd != null ? '$' + fmt(r.pnl_usd, 2) : '—'}</td>
+              <td class="r ${cls}">${r.pnl_usd != null ? '$' + signFmt(r.pnl_usd, 2) : '—'}</td>
             </tr>`;
           }).join('')}</tbody>
         </table>` : '<div class="muted">No closed trades yet.</div>'}

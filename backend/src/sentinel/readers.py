@@ -138,19 +138,90 @@ def driftedge_top_markets(data_dir: Path, top: int = 30) -> dict[str, Any]:
 
 
 def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
-    """Read paper_trades.parquet and summarize open + closed positions."""
-    path = data_dir / "paper_trades.parquet"
-    if not path.exists():
+    """Read paper_trades.parquet + paper_state.parquet and return a
+    multi-trader summary."""
+    trades_path = data_dir / "paper_trades.parquet"
+    state_path = data_dir / "paper_state.parquet"
+    if not trades_path.exists():
         return {"status": "no_data"}
     try:
-        df = pd.read_parquet(path)
+        df = pd.read_parquet(trades_path)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
         return {"status": "no_data"}
 
+    # Per-trader portfolio state from state file
+    state_by_trader: dict[str, dict[str, Any]] = {}
+    if state_path.exists():
+        try:
+            st = pd.read_parquet(state_path)
+            for _, r in st.iterrows():
+                state_by_trader[str(r["trader"])] = {
+                    "bankroll_init": float(r["bankroll_init"]),
+                    "cash_usd": round(float(r["cash_usd"]), 2),
+                    "open_exposure": round(float(r["open_exposure"]), 2),
+                    "closed_pnl": round(float(r["closed_pnl"]), 2),
+                    "total_equity": round(float(r["cash_usd"]) + float(r["open_exposure"]), 2),
+                    "peak_equity": round(float(r["peak_equity"]), 2),
+                    "drawdown_pct": round(float(r["current_drawdown_pct"]), 3),
+                }
+        except Exception:
+            pass
+
     open_df = df[df["status"] == "open"]
     closed_df = df[df["status"] != "open"]
+
+    # Per-trader metrics
+    by_trader: dict[str, dict[str, Any]] = {}
+    traders_seen = set(state_by_trader.keys())
+    if "trader" in df.columns:
+        traders_seen.update(df["trader"].fillna("?").unique())
+    for t in sorted(traders_seen):
+        t_df = df[df["trader"].fillna("?") == t] if "trader" in df.columns else df.head(0)
+        t_open = t_df[t_df["status"] == "open"]
+        t_closed = t_df[t_df["status"] != "open"]
+        state = state_by_trader.get(t, {})
+        equity = state.get("total_equity")
+        bankroll = state.get("bankroll_init")
+        by_trader[t] = {
+            **state,
+            "total_trades": len(t_df),
+            "open_count": len(t_open),
+            "closed_count": len(t_closed),
+            "wins": int((t_closed["pnl_usd"] > 0).sum()) if not t_closed.empty else 0,
+            "losses": int((t_closed["pnl_usd"] <= 0).sum()) if not t_closed.empty else 0,
+            "hit_rate": (
+                round(float((t_closed["pnl_usd"] > 0).mean()), 3)
+                if not t_closed.empty else None
+            ),
+            "avg_size": (
+                round(float(t_df["entry_size_usd"].mean()), 2)
+                if "entry_size_usd" in t_df.columns and not t_df.empty else None
+            ),
+            "return_pct": (
+                round((equity / bankroll - 1) * 100, 3)
+                if (equity is not None and bankroll) else None
+            ),
+        }
+
+    by_venue: dict[str, dict[str, Any]] = {}
+    for v in df.get("venue", pd.Series(dtype=str)).fillna("unknown").unique():
+        v_df = df[df["venue"].fillna("unknown") == v]
+        v_closed = v_df[v_df["status"] != "open"]
+        by_venue[str(v)] = {
+            "total": len(v_df),
+            "open": int((v_df["status"] == "open").sum()),
+            "closed": len(v_closed),
+            "pnl_usd": (
+                round(float(v_closed["pnl_usd"].fillna(0).sum()), 2)
+                if not v_closed.empty else 0.0
+            ),
+            "hit_rate": (
+                round(float((v_closed["pnl_usd"] > 0).mean()), 3)
+                if not v_closed.empty else None
+            ),
+        }
 
     summary = {
         "total_trades": len(df),
@@ -174,14 +245,19 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
             closed_df["exit_reason"].value_counts().to_dict()
             if not closed_df.empty else {}
         ),
+        "by_venue": by_venue,
+        "by_trader": by_trader,
     }
 
     def _row(r) -> dict:
         return {
             "trade_id": r.get("trade_id"),
+            "trader": r.get("trader") or "—",
+            "venue": r.get("venue") or "—",
             "question": r.get("question"),
             "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
             "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
+            "size_usd": round(float(r["entry_size_usd"]), 2) if pd.notna(r.get("entry_size_usd")) else None,
             "target": round(float(r["target"]), 3) if pd.notna(r.get("target")) else None,
             "stop": round(float(r["stop"]), 3) if pd.notna(r.get("stop")) else None,
             "status": r.get("status"),
