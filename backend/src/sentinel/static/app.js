@@ -158,6 +158,14 @@ function kpi(label, value, sub) {
   </div>`;
 }
 
+const CHART_TIME_OPTS = {
+  type: "time",
+  adapters: { date: { zone: "America/New_York" } },
+  time: { unit: "hour", displayFormats: { hour: "MMM-d HH:mm", minute: "HH:mm" }},
+  ticks: { color: "#666666", font: { family: "JetBrains Mono, monospace", size: 10 } },
+  grid: { color: "#1a1a1a" },
+};
+
 const CHART_BASE = {
   responsive: true,
   maintainAspectRatio: false,
@@ -283,8 +291,7 @@ function drawEquityChart(canvasId, eq) {
     options: {
       ...CHART_BASE,
       scales: {
-        x: { ...CHART_BASE.scales.x, type: "time",
-             time: { unit: "hour", displayFormats: { hour: "MMM-d HH:mm" }}},
+        x: CHART_TIME_OPTS,
         y: { ...CHART_BASE.scales.y,
              ticks: { ...CHART_BASE.scales.y.ticks,
                       callback: v => "$" + v.toLocaleString() }},
@@ -311,7 +318,7 @@ async function renderPSChain() {
         <div class="card-title">SNAPSHOT METADATA</div>
         <table>
           <tbody>
-            <tr><td class="muted">Snapshot UTC</td><td>${d.snapshot_ts ?? "—"}</td></tr>
+            <tr><td class="muted">Snapshot</td><td>${fmtTsLocal(d.snapshot_ts)} ET</td></tr>
             <tr><td class="muted">Call volume</td><td class="r">${fmtInt(d.total_call_vol)}</td></tr>
             <tr><td class="muted">Put volume</td><td class="r">${fmtInt(d.total_put_vol)}</td></tr>
             <tr><td class="muted">File</td><td class="muted" style="font-size:10px">${d.file_path}</td></tr>
@@ -457,7 +464,7 @@ async function renderDEPaper() {
             <th class="r">Entry</th><th class="r">Size</th>
             <th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th>
           </tr></thead>
-          <tbody>${d.open.map(r => `<tr>
+          <tbody>${d.open.map(r => `<tr data-venue="${r.venue}" data-market-id="${r.market_id}" class="clickable-row">
             <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
             <td class="muted" style="font-size:10px">${r.venue}</td>
             <td class="ell" style="max-width:240px">${r.question ?? ''}</td>
@@ -493,20 +500,24 @@ async function renderDEPaper() {
       </div>
 
       <div class="card">
-        <div class="card-title">CLOSED POSITIONS (most recent 30, all traders)</div>
+        <div class="card-title">CLOSED POSITIONS (${d.closed.length}, all traders, all time)</div>
         ${d.closed.length ? `<table>
           <thead><tr>
-            <th>Trader</th><th>Venue</th><th>Question</th>
-            <th class="r">Entry</th><th class="r">Exit</th><th class="r">Size</th>
-            <th>Reason</th><th class="r">P&L</th>
+            <th>Trader</th><th>Venue</th><th>Cat</th><th>Question</th>
+            <th>Entry @</th><th class="r">Entry</th>
+            <th>Exit @</th><th class="r">Exit</th>
+            <th class="r">Size</th><th>Reason</th><th class="r">P&L</th>
           </tr></thead>
           <tbody>${d.closed.map(r => {
             const cls = signClass(r.pnl_usd);
-            return `<tr>
+            return `<tr data-venue="${r.venue}" data-market-id="${r.market_id}" class="clickable-row">
               <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
               <td class="muted" style="font-size:10px">${r.venue}</td>
+              <td class="muted" style="font-size:10px">${(r.category || '—').toUpperCase()}</td>
               <td class="ell" style="max-width:220px">${r.question ?? ''}</td>
+              <td class="muted" style="font-size:10px">${fmtTsLocal(r.entry_ts)}</td>
               <td class="r">${fmt(r.entry_price, 3)}</td>
+              <td class="muted" style="font-size:10px">${fmtTsLocal(r.exit_ts)}</td>
               <td class="r">${r.exit_price != null ? fmt(r.exit_price, 3) : '—'}</td>
               <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
               <td class="amber">${r.exit_reason ?? ''}</td>
@@ -515,6 +526,13 @@ async function renderDEPaper() {
           }).join('')}</tbody>
         </table>` : '<div class="muted">No closed trades yet.</div>'}
       </div>`);
+
+    document.querySelectorAll(".clickable-row").forEach(row => {
+      row.style.cursor = "pointer";
+      row.addEventListener("click", () => {
+        openMarketDetail(row.dataset.venue, row.dataset.marketId);
+      });
+    });
 
     drawEquityChart("paperEquityChart", eq);
   } catch (e) {
@@ -539,7 +557,7 @@ async function renderDEMarkets() {
       </div>
 
       <div class="muted mono" style="margin-bottom:12px">
-        Snapshot: ${d.snapshot_ts ?? "—"} · ${d.count} markets · sorted by 24h volume
+        Snapshot: ${fmtTsLocal(d.snapshot_ts)} ET · ${d.count} markets · sorted by 24h volume
       </div>
       <table>
         <thead><tr>
@@ -547,7 +565,7 @@ async function renderDEMarkets() {
           <th class="r">Spread</th><th class="r">Vol 24h</th><th>End</th>
         </tr></thead>
         <tbody>
-          ${d.items.map(r => `<tr>
+          ${d.items.map(r => `<tr data-venue="polymarket" data-market-id="${r.market_id}" class="clickable-row">
             <td class="ell">${r.question ?? ''}</td>
             <td class="r pos">${fmt(r.yes_price, 3)}</td>
             <td class="r neg">${fmt(r.no_price, 3)}</td>
@@ -557,6 +575,12 @@ async function renderDEMarkets() {
           </tr>`).join('')}
         </tbody>
       </table>`);
+
+    document.querySelectorAll(".clickable-row").forEach(row => {
+      row.addEventListener("click", () => {
+        openMarketDetail(row.dataset.venue, row.dataset.marketId);
+      });
+    });
 
     if (dist.status === "ok") {
       mkChart("priceDistChart", {
@@ -601,8 +625,8 @@ async function renderDEBooks() {
           ${d.items.map(r => `<tr>
             <td class="amber">${r.market_id}</td>
             <td class="r">${r.snapshot_count_today}</td>
-            <td class="muted">${r.last_snapshot_ts ?? '—'}</td>
-            <td class="muted">${r.file_mtime}</td>
+            <td class="muted">${fmtTsLocal(r.last_snapshot_ts)}</td>
+            <td class="muted">${fmtTsLocal(r.file_mtime)}</td>
           </tr>`).join('')}
         </tbody>
       </table>`);
@@ -664,7 +688,7 @@ async function renderSEHealth() {
     const log = await jget("/api/logs/driftedge?max_lines=50");
     const events = (log.events ?? []).reverse();
     const html = events.map(e => `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
-      <span class="log-ts">${e.ts?.slice(11, 23)}</span>
+      <span class="log-ts">${fmtTimeLocal(e.ts)}</span>
       <span class="log-channel">${e.channel}</span>
       <span class="log-kind">${e.kind}</span>
     </div>`).join("");
@@ -689,7 +713,7 @@ async function renderLogs(source) {
           typeof v === 'object' ? JSON.stringify(v) : String(v)
         }</b></span>`).join(' ');
       return `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
-        <span class="log-ts">${e.ts?.slice(11, 23)}</span>
+        <span class="log-ts">${fmtTimeLocal(e.ts)}</span>
         <span class="log-channel">${e.channel}</span>
         <span class="log-kind">${e.kind}</span>${fields}
       </div>`;
@@ -699,5 +723,117 @@ async function renderLogs(source) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
 }
+
+// ──────────────── MARKET DETAIL MODAL ────────────────
+
+let modalChart = null;
+
+async function openMarketDetail(venue, marketId) {
+  // Build overlay
+  const back = document.createElement("div");
+  back.className = "modal-back";
+  back.innerHTML = `
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <span class="modal-title">MARKET DETAIL · ${venue.toUpperCase()} · ${marketId.slice(0,40)}${marketId.length>40?'…':''}</span>
+        <button class="modal-close">CLOSE ×</button>
+      </div>
+      <div class="modal-body" id="modalBody"><div class="muted">Loading…</div></div>
+    </div>`;
+  back.addEventListener("click", () => closeModal());
+  back.querySelector(".modal-close").addEventListener("click", () => closeModal());
+  document.body.appendChild(back);
+
+  try {
+    const d = await jget(`/api/driftedge/market/${venue}/${encodeURIComponent(marketId)}`);
+    if (d.status === "no_data") {
+      document.getElementById("modalBody").innerHTML = '<div class="muted">No data for this market in our archive.</div>';
+      return;
+    }
+    const m = d.meta || {};
+    const histCount = d.history.length;
+    const html = `
+      <div class="grid grid-4" style="margin-bottom:14px">
+        ${kpi("Category", (m.category || '—').toUpperCase())}
+        ${kpi("Yes mid", m.yes_price != null ? fmt(m.yes_price, 3) : '—')}
+        ${kpi("Spread", m.spread != null ? fmt(m.spread, 3) : '—')}
+        ${kpi("Vol 24h", m.volume_24h != null ? '$' + fmtInt(m.volume_24h) : '—')}
+      </div>
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-title">QUESTION</div>
+        <div style="font-family:var(--mono);font-size:13px">${m.question ?? '(unknown)'}</div>
+        ${m.end_date ? `<div class="muted mono" style="font-size:11px;margin-top:6px">Resolves: ${fmtTsLocal(m.end_date)} ET</div>` : ''}
+      </div>
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-title">PRICE HISTORY · ${histCount} ORDERBOOK SNAPSHOTS</div>
+        ${histCount > 0
+          ? '<div class="chart-wrap tall"><canvas id="detailHistChart"></canvas></div>'
+          : '<div class="muted">No orderbook snapshots archived for this market yet.</div>'}
+      </div>
+      ${d.trades.length ? `
+        <div class="card">
+          <div class="card-title">PAPER TRADES ON THIS MARKET (${d.trades.length})</div>
+          <table>
+            <thead><tr><th>Trader</th><th>Entry @</th><th class="r">Entry</th>
+              <th>Exit @</th><th class="r">Exit</th><th>Reason</th><th class="r">P&L</th></tr></thead>
+            <tbody>${d.trades.map(t => {
+              const cls = signClass(t.pnl_usd);
+              return `<tr>
+                <td style="color:${TRADER_COLORS[t.trader] || 'var(--text)'}">${(t.trader || '—').toUpperCase()}</td>
+                <td class="muted" style="font-size:10px">${fmtTsLocal(t.entry_ts)}</td>
+                <td class="r">${fmt(t.entry_price, 3)}</td>
+                <td class="muted" style="font-size:10px">${fmtTsLocal(t.exit_ts)}</td>
+                <td class="r">${t.exit_price != null ? fmt(t.exit_price, 3) : '—'}</td>
+                <td class="amber">${t.exit_reason ?? (t.status === 'open' ? '(open)' : '—')}</td>
+                <td class="r ${cls}">${t.pnl_usd != null ? '$' + signFmt(t.pnl_usd, 2) : '—'}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table>
+        </div>` : ''}
+    `;
+    document.getElementById("modalBody").innerHTML = html;
+
+    if (histCount > 0) {
+      const ctx = document.getElementById("detailHistChart").getContext("2d");
+      modalChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          datasets: [
+            { label: "MID", data: d.history.map(p => ({ x: p.ts, y: p.mid })),
+              borderColor: "#ff9000", borderWidth: 2, pointRadius: 0,
+              spanGaps: true, tension: 0.05 },
+            { label: "BID", data: d.history.map(p => ({ x: p.ts, y: p.bid })),
+              borderColor: "#00ff88", borderWidth: 1, borderDash: [3,3],
+              pointRadius: 0, spanGaps: true, tension: 0.05 },
+            { label: "ASK", data: d.history.map(p => ({ x: p.ts, y: p.ask })),
+              borderColor: "#ff4444", borderWidth: 1, borderDash: [3,3],
+              pointRadius: 0, spanGaps: true, tension: 0.05 },
+          ],
+        },
+        options: {
+          ...CHART_BASE,
+          scales: {
+            x: CHART_TIME_OPTS,
+            y: { ...CHART_BASE.scales.y, min: 0, max: 1,
+                 ticks: { ...CHART_BASE.scales.y.ticks,
+                          callback: v => Number(v).toFixed(2) }},
+          },
+        },
+      });
+    }
+  } catch (e) {
+    document.getElementById("modalBody").innerHTML = `<div class="neg">Error: ${e.message}</div>`;
+  }
+}
+
+function closeModal() {
+  const back = document.querySelector(".modal-back");
+  if (back) back.remove();
+  if (modalChart) { try { modalChart.destroy(); } catch (e) {} modalChart = null; }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeModal();
+});
 
 document.addEventListener("DOMContentLoaded", init);

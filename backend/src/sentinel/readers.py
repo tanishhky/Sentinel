@@ -282,8 +282,10 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
             "trader": r.get("trader") or "—",
             "venue": r.get("venue") or "—",
             "category": r.get("category") or "—",
+            "market_id": r.get("market_id"),
             "question": r.get("question"),
             "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
+            "exit_ts": str(r.get("exit_ts")) if pd.notna(r.get("exit_ts")) else None,
             "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
             "size_usd": round(float(r["entry_size_usd"]), 2) if pd.notna(r.get("entry_size_usd")) else None,
             "target": round(float(r["target"]), 3) if pd.notna(r.get("target")) else None,
@@ -299,7 +301,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
         "summary": summary,
         "open": [_row(r) for _, r in open_df.iterrows()],
         "closed": [_row(r) for _, r in closed_df.sort_values(
-            "exit_ts", ascending=False).head(30).iterrows()],
+            "exit_ts", ascending=False).iterrows()],
     }
 
 
@@ -452,6 +454,116 @@ def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
             },
         },
     }
+
+
+def driftedge_market_detail(data_dir: Path, venue: str,
+                            market_id: str) -> dict[str, Any]:
+    """Per-market deep dive: latest snapshot + price history from book archive + paper trades."""
+    markets_root = data_dir / "markets" / venue
+    meta: dict[str, Any] = {}
+    if markets_root.exists():
+        latest_mp = _latest_file(markets_root)
+        if latest_mp is not None:
+            try:
+                mdf = pd.read_parquet(latest_mp)
+                if "_snapshot_ts" in mdf.columns:
+                    mdf = mdf[mdf["_snapshot_ts"] == mdf["_snapshot_ts"].max()]
+                hit = mdf[mdf["market_id"] == market_id]
+                if not hit.empty:
+                    r = hit.iloc[0]
+                    meta = {
+                        "venue": venue,
+                        "market_id": market_id,
+                        "question": r.get("question"),
+                        "category": r.get("category"),
+                        "end_date": r.get("end_date"),
+                        "yes_price": float(r["yes_price"]) if pd.notna(r.get("yes_price")) else None,
+                        "no_price": float(r["no_price"]) if pd.notna(r.get("no_price")) else None,
+                        "best_bid": float(r["best_bid"]) if pd.notna(r.get("best_bid")) else None,
+                        "best_ask": float(r["best_ask"]) if pd.notna(r.get("best_ask")) else None,
+                        "spread": float(r["spread"]) if pd.notna(r.get("spread")) else None,
+                        "volume_24h": float(r["volume_24h"]) if pd.notna(r.get("volume_24h")) else None,
+                    }
+            except Exception:
+                pass
+
+    books_root = data_dir / "books" / venue / market_id
+    points: list[dict[str, Any]] = []
+    if books_root.exists():
+        for parquet in sorted(books_root.glob("*.parquet")):
+            try:
+                bdf = pd.read_parquet(parquet)
+            except Exception:
+                continue
+            if bdf.empty or "snapshot_ts" not in bdf.columns:
+                continue
+            for ts, snap in bdf.groupby("snapshot_ts"):
+                bids = snap[snap["side"] == "bid"]
+                asks = snap[snap["side"] == "ask"]
+                top_bid = float(bids["price"].max()) if not bids.empty else None
+                top_ask = float(asks["price"].min()) if not asks.empty else None
+                mid = (top_bid + top_ask) / 2 if (top_bid is not None and top_ask is not None) else None
+                points.append({"ts": str(ts), "bid": top_bid,
+                               "ask": top_ask, "mid": mid})
+    points.sort(key=lambda p: p["ts"])
+
+    trades: list[dict[str, Any]] = []
+    trades_path = data_dir / "paper_trades.parquet"
+    if trades_path.exists():
+        try:
+            tdf = pd.read_parquet(trades_path)
+            if "market_id" in tdf.columns:
+                hit = tdf[tdf["market_id"] == market_id]
+                for _, r in hit.iterrows():
+                    trades.append({
+                        "trader": r.get("trader"),
+                        "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
+                        "entry_price": float(r["entry_price"]) if pd.notna(r.get("entry_price")) else None,
+                        "exit_ts": str(r.get("exit_ts")) if pd.notna(r.get("exit_ts")) else None,
+                        "exit_price": float(r["exit_price"]) if pd.notna(r.get("exit_price")) else None,
+                        "exit_reason": r.get("exit_reason"),
+                        "size_usd": float(r["entry_size_usd"]) if pd.notna(r.get("entry_size_usd")) else None,
+                        "pnl_usd": float(r["pnl_usd"]) if pd.notna(r.get("pnl_usd")) else None,
+                        "status": r.get("status"),
+                    })
+        except Exception:
+            pass
+
+    return {
+        "status": "ok" if (meta or points) else "no_data",
+        "meta": meta,
+        "history": points,
+        "trades": trades,
+        "snapshot_count": len(points),
+    }
+
+
+def driftedge_review_queue(data_dir: Path) -> dict[str, Any]:
+    """Markets with confidence != 'high' awaiting manual classification."""
+    p = data_dir / "market_categories.parquet"
+    if not p.exists():
+        return {"status": "no_data", "items": [], "stats": {}}
+    try:
+        df = pd.read_parquet(p)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty:
+        return {"status": "ok", "items": [], "stats": {"total": 0}}
+
+    review = df[~df["decided"]].copy()
+    items = review.sort_values("first_seen", ascending=False).head(100).to_dict("records")
+    for r in items:
+        for k in ("first_seen", "decided_at"):
+            if k in r and r[k] is not None:
+                r[k] = str(r[k])
+    stats = {
+        "total": len(df),
+        "decided": int(df["decided"].sum()),
+        "needs_review": int((~df["decided"]).sum()),
+        "by_category": df["category"].value_counts().to_dict(),
+        "by_confidence": df["confidence"].value_counts().to_dict(),
+    }
+    return {"status": "ok", "items": items, "stats": stats}
 
 
 def driftedge_active_books(data_dir: Path) -> dict[str, Any]:

@@ -88,6 +88,15 @@ def create_app() -> FastAPI:
             Path("/Users/tanishkyadav/dev/Sentinel/logs"),
         )
 
+    @app.get("/api/driftedge/market/{venue}/{market_id:path}")
+    def driftedge_market(venue: str, market_id: str):
+        return readers.driftedge_market_detail(c.driftedge_data,
+                                                venue, market_id)
+
+    @app.get("/api/driftedge/classifier/review")
+    def driftedge_review():
+        return readers.driftedge_review_queue(c.driftedge_data)
+
     @app.get("/api/logs/pinsight")
     def logs_pinsight(max_lines: int = 200):
         return {"events": readers.tail_log_dir(c.pinsight_logs, max_lines)}
