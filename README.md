@@ -4,11 +4,13 @@
 
 Sentinel is a thin viewing layer over the data accumulated by [PinSight](https://github.com/tanishhky/PinSight) (0DTE options) and [DriftEdge](https://github.com/tanishhky/DriftEdge) (prediction markets). It reads from their Parquet stores and JSONL log streams, and presents everything in a Bloomberg-terminal-styled web UI.
 
-Sentinel does not trade. Sentinel does not produce signals. Sentinel only shows.
+**Sentinel does not trade. Sentinel does not produce signals. Sentinel only shows.**
+
+**Sentinel does NOT contain any code from PinSight or DriftEdge.** Both projects live in their own repos at `~/dev/PinSight` and `~/dev/DriftEdge`. Sentinel references them by filesystem path via environment variables and reads their Parquet/JSONL artifacts. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the contract that keeps the three repos cleanly separated.
 
 ## Status
 
-**v0.5 shipped (2026-05-31):** Two-level tabbed navigation (DASHBOARD | PINSIGHT | DRIFTEDGE | SENTINEL), Bloomberg Amber theme, Chart.js-powered equity curve and price distribution charts, system health page with per-process status, multi-trader paper-trading display. Vanilla HTML + JS served by FastAPI — no Node dependency.
+**v0.6 shipped (2026-06-01):** Two-level tabbed navigation, Bloomberg Amber theme, ET timezones everywhere, cache-busted static assets, clickable market detail modal with full orderbook-archive price-history charts, all closed positions (no cap) with entry & exit times in ET, BY CATEGORY diagnostic panel, per-process system health page, mark-to-market equity curve extending to "now", and a Bloomberg-style NEWS tab with VADER sentiment scoring. Vanilla HTML + JS served by FastAPI — no Node dependency.
 
 **Operationally:** the project lives at `~/dev/Sentinel/`. A launchd job auto-starts the FastAPI server on login. Open <http://127.0.0.1:8765>.
 

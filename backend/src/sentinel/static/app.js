@@ -21,6 +21,7 @@ const SUB_TABS = {
     { id: "paper",   label: "PAPER",   render: renderDEPaper },
     { id: "markets", label: "MARKETS", render: renderDEMarkets },
     { id: "books",   label: "BOOKS",   render: renderDEBooks },
+    { id: "news",    label: "NEWS",    render: renderDENews },
     { id: "logs",    label: "LOGS",    render: () => renderLogs("driftedge") },
   ],
   sentinel: [
@@ -719,6 +720,81 @@ async function renderLogs(source) {
       </div>`;
     }).join("");
     set(`<div class="card"><div class="logs">${html}</div></div>`);
+  } catch (e) {
+    set(`<div class="neg">Error: ${e.message}</div>`);
+  }
+}
+
+// ──────────────── DRIFTEDGE NEWS (Bloomberg-style) ────────────────
+
+let newsFilter = { category: "", sentiment: "" };
+
+async function renderDENews() {
+  try {
+    const qs = new URLSearchParams();
+    if (newsFilter.category) qs.set("category", newsFilter.category);
+    if (newsFilter.sentiment) qs.set("sentiment", newsFilter.sentiment);
+    qs.set("limit", "300");
+    const d = await jget("/api/driftedge/news?" + qs.toString());
+    if (d.status !== "ok") {
+      set(`<div class="muted">No news yet. Run <code>driftedge fetch-news</code> or wait for the daemon's 15-minute sweep.</div>`);
+      return;
+    }
+    const s = d.stats;
+    const cats = Object.keys(s.by_category || {}).sort();
+    const sources = Object.keys(s.by_source || {}).sort();
+
+    set(`
+      <div class="grid grid-4" style="margin-bottom:12px">
+        ${kpi("Total items", s.total)}
+        ${kpi("Positive", `<span class="pos">${s.by_sentiment?.positive ?? 0}</span>`)}
+        ${kpi("Negative", `<span class="neg">${s.by_sentiment?.negative ?? 0}</span>`)}
+        ${kpi("Neutral", `<span class="muted">${s.by_sentiment?.neutral ?? 0}</span>`)}
+      </div>
+
+      <div class="news-filter-bar">
+        <span class="muted mono" style="font-size:10px">Filter:</span>
+        <select id="catFilter">
+          <option value="">All categories</option>
+          ${cats.map(c => `<option value="${c}" ${newsFilter.category===c?'selected':''}>${c.toUpperCase()} (${s.by_category[c]})</option>`).join('')}
+        </select>
+        <select id="sentFilter">
+          <option value="">All sentiment</option>
+          <option value="positive" ${newsFilter.sentiment==='positive'?'selected':''}>POSITIVE</option>
+          <option value="negative" ${newsFilter.sentiment==='negative'?'selected':''}>NEGATIVE</option>
+          <option value="neutral"  ${newsFilter.sentiment==='neutral'?'selected':''}>NEUTRAL</option>
+        </select>
+        <span class="muted mono" style="font-size:10px;margin-left:auto">Showing ${d.items.length} of ${s.total}</span>
+      </div>
+
+      <div class="card" style="padding:0">
+        <div class="news-row" style="background:var(--bg-2);border-bottom:1px solid var(--border-2);color:var(--primary);text-transform:uppercase;font-size:10px;letter-spacing:0.06em">
+          <span>Time (ET)</span><span>Cat</span><span>Source</span><span class="news-sent">Sentiment</span><span>Headline</span>
+        </div>
+        ${d.items.map(it => {
+          const sc = it.sentiment_score;
+          const cls = `sent-${it.sentiment_label}`;
+          const sign = sc >= 0 ? "+" : "";
+          const arrow = sc > 0.2 ? "▲" : sc < -0.2 ? "▼" : "■";
+          return `<div class="news-row">
+            <span class="news-time">${fmtTimeLocal(it.published_ts)}</span>
+            <span class="news-cat">${(it.category || '—').toUpperCase()}</span>
+            <span class="news-source">${(it.source || '—').replace('reddit:', 'r/').slice(0,18)}</span>
+            <span class="news-sent ${cls}">${arrow} ${sign}${sc.toFixed(2)}</span>
+            <span class="news-headline"><a href="${it.url}" target="_blank" rel="noopener">${it.headline}</a></span>
+          </div>`;
+        }).join('')}
+      </div>
+    `);
+
+    document.getElementById("catFilter").addEventListener("change", (e) => {
+      newsFilter.category = e.target.value;
+      renderDENews();
+    });
+    document.getElementById("sentFilter").addEventListener("change", (e) => {
+      newsFilter.sentiment = e.target.value;
+      renderDENews();
+    });
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }

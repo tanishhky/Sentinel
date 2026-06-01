@@ -11,11 +11,13 @@ Routes:
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
@@ -23,6 +25,9 @@ from . import readers
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
+# Server-process boot timestamp used as cache-buster for static assets.
+# Every server restart invalidates the browser cache automatically.
+_VERSION = int(time.time())
 
 
 def create_app() -> FastAPI:
@@ -31,9 +36,20 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
-    @app.get("/")
+    @app.get("/", response_class=HTMLResponse)
     def root():
-        return FileResponse(_STATIC_DIR / "index.html")
+        # Inject ?v=<boot_ts> into static asset URLs so the browser fetches
+        # fresh app.js / theme.css after every server restart.
+        html = (_STATIC_DIR / "index.html").read_text()
+        html = html.replace("/static/theme.css",
+                            f"/static/theme.css?v={_VERSION}")
+        html = html.replace("/static/app.js",
+                            f"/static/app.js?v={_VERSION}")
+        return HTMLResponse(content=html, headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
 
     app.add_middleware(
         CORSMiddleware,
@@ -96,6 +112,14 @@ def create_app() -> FastAPI:
     @app.get("/api/driftedge/classifier/review")
     def driftedge_review():
         return readers.driftedge_review_queue(c.driftedge_data)
+
+    @app.get("/api/driftedge/news")
+    def driftedge_news(category: Optional[str] = None,
+                       sentiment: Optional[str] = None,
+                       limit: int = 200):
+        return readers.driftedge_news(c.driftedge_data,
+                                       category=category,
+                                       sentiment=sentiment, limit=limit)
 
     @app.get("/api/logs/pinsight")
     def logs_pinsight(max_lines: int = 200):

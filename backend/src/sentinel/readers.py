@@ -306,11 +306,13 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
 
 
 def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
-    """Compute equity time series per trader from closed trades.
+    """Compute equity time series per trader from closed trades, then
+    extend the line to NOW by marking open positions to market via the
+    most recent orderbook snapshot for each open market.
 
-    Equity(t) = bankroll_init + sum of pnl_usd for closed trades with
-    exit_ts <= t. Open positions are not marked to market in this
-    minimal version; the curve steps each time a trade closes.
+    Equity(t) = bankroll_init + sum(pnl_usd for closed trades exit_ts <= t)
+              + mark-to-market(open positions @ t)
+    The final point is at datetime.now() so the chart never looks 'stuck'.
     """
     trades_path = data_dir / "paper_trades.parquet"
     state_path = data_dir / "paper_state.parquet"
@@ -332,24 +334,63 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
         except Exception:
             pass
 
+    # Mark-to-market helper: read latest orderbook for each open market.
+    def _latest_mid(venue: str, market_id: str) -> Optional[float]:
+        books_dir = data_dir / "books" / venue / market_id
+        if not books_dir.exists():
+            return None
+        latest = max(books_dir.glob("*.parquet"),
+                     key=lambda p: p.stat().st_mtime, default=None)
+        if latest is None:
+            return None
+        try:
+            bdf = pd.read_parquet(latest)
+            if bdf.empty or "snapshot_ts" not in bdf.columns:
+                return None
+            snap = bdf[bdf["snapshot_ts"] == bdf["snapshot_ts"].max()]
+            bids = snap[snap["side"] == "bid"]
+            asks = snap[snap["side"] == "ask"]
+            if bids.empty or asks.empty:
+                return None
+            return (float(bids["price"].max()) + float(asks["price"].min())) / 2.0
+        except Exception:
+            return None
+
     closed = df[df["status"] != "open"].copy()
+    open_pos = df[df["status"] == "open"].copy()
     series: dict[str, list[dict[str, Any]]] = {}
+    now_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
     for trader in sorted(df["trader"].fillna("?").unique()):
         bank = bankrolls.get(trader, 10000.0)
         t_closed = closed[closed["trader"] == trader].copy()
-        # Always seed with bankroll at min trade entry time (or now if none)
         seed_ts = df[df["trader"] == trader]["entry_ts"].min()
         if seed_ts is None or pd.isna(seed_ts):
-            seed_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            seed_ts = now_ts
         points = [{"ts": str(seed_ts), "equity": round(bank, 2)}]
 
+        running = bank
         if not t_closed.empty:
             t_closed = t_closed.sort_values("exit_ts")
-            running = bank
             for _, r in t_closed.iterrows():
                 running += float(r.get("pnl_usd") or 0.0)
                 points.append({"ts": str(r.get("exit_ts")),
                                "equity": round(running, 2)})
+
+        # Mark open positions to market and append a "now" point so the
+        # equity line extends to the current moment.
+        t_open = open_pos[open_pos["trader"] == trader]
+        unrealized = 0.0
+        for _, op in t_open.iterrows():
+            mid = _latest_mid(op.get("venue", "polymarket"),
+                              op.get("market_id"))
+            if mid is None:
+                continue
+            entry = float(op.get("entry_price") or 0.0)
+            shares = float(op.get("shares") or 0.0)
+            unrealized += (mid - entry) * shares
+        points.append({"ts": now_ts,
+                       "equity": round(running + unrealized, 2)})
 
         series[trader] = points
 
@@ -562,6 +603,59 @@ def driftedge_review_queue(data_dir: Path) -> dict[str, Any]:
         "needs_review": int((~df["decided"]).sum()),
         "by_category": df["category"].value_counts().to_dict(),
         "by_confidence": df["confidence"].value_counts().to_dict(),
+    }
+    return {"status": "ok", "items": items, "stats": stats}
+
+
+def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
+                   sentiment: Optional[str] = None,
+                   limit: int = 200) -> dict[str, Any]:
+    """Latest news items (Bloomberg-style headline + source + sentiment)."""
+    news_dir = data_dir / "news"
+    if not news_dir.exists():
+        return {"status": "no_data", "items": [], "stats": {}}
+    files = sorted(news_dir.glob("*.parquet"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    if not files:
+        return {"status": "no_data", "items": [], "stats": {}}
+
+    dfs = []
+    for p in files:
+        try:
+            dfs.append(pd.read_parquet(p))
+        except Exception:
+            continue
+    if not dfs:
+        return {"status": "no_data", "items": [], "stats": {}}
+    full = pd.concat(dfs, ignore_index=True).drop_duplicates(
+        subset=["id"], keep="first")
+
+    df = full.copy()
+    if category:
+        df = df[df["category"] == category]
+    if sentiment:
+        df = df[df["sentiment_label"] == sentiment]
+
+    df = df.sort_values("published_ts", ascending=False).head(limit)
+    items = []
+    for _, r in df.iterrows():
+        items.append({
+            "id": r.get("id"),
+            "source": r.get("source"),
+            "headline": r.get("headline"),
+            "url": r.get("url"),
+            "published_ts": str(r.get("published_ts")) if r.get("published_ts") else None,
+            "category": r.get("category") or "other",
+            "sentiment_score": float(r["sentiment_score"]) if pd.notna(r.get("sentiment_score")) else 0.0,
+            "sentiment_label": r.get("sentiment_label") or "neutral",
+        })
+
+    stats = {
+        "total": len(full),
+        "by_sentiment": full["sentiment_label"].value_counts().to_dict(),
+        "by_category": full["category"].value_counts().to_dict(),
+        "by_source": full["source"].value_counts().head(15).to_dict(),
+        "files_loaded": [p.name for p in files],
     }
     return {"status": "ok", "items": items, "stats": stats}
 
