@@ -68,6 +68,102 @@ def pinsight_latest_chain(data_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def pinsight_chain_full(data_dir: Path, top_contracts: int = 30) -> dict[str, Any]:
+    """Latest chain with IV-smile series, vol-by-strike aggregates, and a
+    top-volume contract list. Drives the CHAIN sub-tab's charts and table.
+    """
+    chains_root = data_dir / "chains"
+    if not chains_root.exists():
+        return {"status": "no_data"}
+
+    latest_path: Optional[Path] = None
+    latest_mtime = 0.0
+    for symbol_dir in chains_root.iterdir():
+        if not symbol_dir.is_dir():
+            continue
+        p = _latest_file(symbol_dir)
+        if p and p.stat().st_mtime > latest_mtime:
+            latest_path, latest_mtime = p, p.stat().st_mtime
+    if latest_path is None:
+        return {"status": "no_data"}
+
+    df = pd.read_parquet(latest_path)
+    if "_snapshot_ts" in df.columns:
+        df = df[df["_snapshot_ts"] == df["_snapshot_ts"].max()]
+    if df.empty:
+        return {"status": "no_data"}
+
+    spot = float(df["underlying_price"].iloc[0]) if "underlying_price" in df.columns else None
+    underlying = latest_path.parent.name
+    expiry = latest_path.stem
+
+    # ── IV smile (calls vs puts) ──
+    # Filter to a realistic strike window: ±15 % of spot. yfinance returns
+    # synthetic IVs in the 2-4 range at deep OTM strikes where there is no
+    # real trade; including those compresses the chart axis until the actual
+    # smile is invisible.
+    lo = spot * 0.85 if spot else 0
+    hi = spot * 1.15 if spot else float("inf")
+    calls_iv: list[dict] = []
+    puts_iv: list[dict] = []
+    for _, r in df.iterrows():
+        iv = r.get("iv")
+        strike = r.get("strike")
+        if pd.isna(iv) or pd.isna(strike):
+            continue
+        s = float(strike)
+        v = float(iv)
+        if v <= 0 or v >= 2.0 or s < lo or s > hi:
+            continue
+        point = {"strike": s, "iv": round(v, 5)}
+        if r.get("contract_type") == "call":
+            calls_iv.append(point)
+        elif r.get("contract_type") == "put":
+            puts_iv.append(point)
+    calls_iv.sort(key=lambda p: p["strike"])
+    puts_iv.sort(key=lambda p: p["strike"])
+
+    # ── Vol-by-strike (stacked calls+puts) ──
+    vol_rows = (df.groupby(["strike", "contract_type"])["volume"]
+                  .sum().unstack(fill_value=0))
+    vol_by_strike = []
+    for strike in sorted(vol_rows.index):
+        vol_by_strike.append({
+            "strike": float(strike),
+            "call_vol": int(vol_rows.loc[strike].get("call", 0) or 0),
+            "put_vol": int(vol_rows.loc[strike].get("put", 0) or 0),
+        })
+
+    # ── Top contracts by volume ──
+    df = df.sort_values("volume", ascending=False).head(top_contracts)
+    contracts = []
+    for _, r in df.iterrows():
+        contracts.append({
+            "ticker": r.get("ticker"),
+            "type": r.get("contract_type"),
+            "strike": float(r["strike"]) if pd.notna(r.get("strike")) else None,
+            "bid": float(r["bid"]) if pd.notna(r.get("bid")) else None,
+            "ask": float(r["ask"]) if pd.notna(r.get("ask")) else None,
+            "mid": float(r["mid"]) if pd.notna(r.get("mid")) else None,
+            "last": float(r["last_price"]) if pd.notna(r.get("last_price")) else None,
+            "volume": int(r["volume"]) if pd.notna(r.get("volume")) else 0,
+            "open_interest": int(r["open_interest"]) if pd.notna(r.get("open_interest")) else 0,
+            "iv": round(float(r["iv"]), 4) if pd.notna(r.get("iv")) else None,
+            "itm": bool(r.get("in_the_money")) if pd.notna(r.get("in_the_money")) else None,
+        })
+
+    return {
+        "status": "ok",
+        "underlying": underlying,
+        "expiry": expiry,
+        "spot": spot,
+        "snapshot_ts": str(df["_snapshot_ts"].max()) if "_snapshot_ts" in df.columns else None,
+        "smile": {"calls": calls_iv, "puts": puts_iv},
+        "vol_by_strike": vol_by_strike,
+        "contracts": contracts,
+    }
+
+
 def pinsight_flagged_contracts(data_dir: Path, top: int = 20) -> dict[str, Any]:
     chains_root = data_dir / "chains"
     if not chains_root.exists():
@@ -638,17 +734,55 @@ def driftedge_review_queue(data_dir: Path) -> dict[str, Any]:
     return {"status": "ok", "items": items, "stats": stats}
 
 
+_NEWS_OVERRIDES_FILE = "news_overrides.parquet"
+
+
+def _load_news_overrides(data_dir: Path) -> dict[str, str]:
+    p = data_dir / _NEWS_OVERRIDES_FILE
+    if not p.exists():
+        return {}
+    try:
+        df = pd.read_parquet(p)
+        return {str(r["id"]): str(r["sentiment_label"]) for _, r in df.iterrows()}
+    except Exception:
+        return {}
+
+
+def write_news_override(data_dir: Path, news_id: str, sentiment_label: str) -> dict:
+    """Persist a manual sentiment override. The reader merges these on next load."""
+    assert sentiment_label in {"positive", "negative", "neutral"}, \
+        f"invalid sentiment_label: {sentiment_label}"
+    p = data_dir / _NEWS_OVERRIDES_FILE
+    overrides = _load_news_overrides(data_dir)
+    overrides[news_id] = sentiment_label
+    rows = [{"id": k, "sentiment_label": v,
+             "overridden_ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            for k, v in overrides.items()]
+    df = pd.DataFrame(rows)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(p, compression="snappy", index=False)
+    return {"status": "ok", "id": news_id, "sentiment_label": sentiment_label,
+            "total_overrides": len(overrides)}
+
+
 def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
                    sentiment: Optional[str] = None,
                    limit: int = 200) -> dict[str, Any]:
-    """Latest news items (Bloomberg-style headline + source + sentiment)."""
+    """Latest news items (Bloomberg-style headline + source + sentiment).
+
+    Returns two stat blocks:
+      * stats_global   — counts across the full multi-day pull (drives the
+                         filter dropdowns and the "total" baseline)
+      * stats_filtered — counts within the active filter (drives the
+                         Positive / Negative / Neutral KPI tiles)
+    """
     news_dir = data_dir / "news"
     if not news_dir.exists():
-        return {"status": "no_data", "items": [], "stats": {}}
+        return {"status": "no_data", "items": [], "stats_global": {}, "stats_filtered": {}}
     files = sorted(news_dir.glob("*.parquet"),
                    key=lambda p: p.stat().st_mtime, reverse=True)[:3]
     if not files:
-        return {"status": "no_data", "items": [], "stats": {}}
+        return {"status": "no_data", "items": [], "stats_global": {}, "stats_filtered": {}}
 
     dfs = []
     for p in files:
@@ -657,9 +791,18 @@ def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
         except Exception:
             continue
     if not dfs:
-        return {"status": "no_data", "items": [], "stats": {}}
+        return {"status": "no_data", "items": [], "stats_global": {}, "stats_filtered": {}}
     full = pd.concat(dfs, ignore_index=True).drop_duplicates(
         subset=["id"], keep="first")
+
+    # ── Merge manual overrides (re-label sentiment, but keep raw score) ──
+    overrides = _load_news_overrides(data_dir)
+    if overrides:
+        full = full.copy()
+        full["_override"] = full["id"].astype(str).map(overrides)
+        mask = full["_override"].notna()
+        full.loc[mask, "sentiment_label"] = full.loc[mask, "_override"]
+        full["overridden"] = mask
 
     df = full.copy()
     if category:
@@ -679,16 +822,34 @@ def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
             "category": r.get("category") or "other",
             "sentiment_score": float(r["sentiment_score"]) if pd.notna(r.get("sentiment_score")) else 0.0,
             "sentiment_label": r.get("sentiment_label") or "neutral",
+            "overridden": bool(r.get("overridden", False)),
         })
 
-    stats = {
+    # Filtered stats power the KPI tiles. We apply the category filter (but
+    # not the sentiment filter — otherwise the +/−/■ breakdown collapses to
+    # one bucket and the comparison stops being useful).
+    df_for_kpi = full[full["category"] == category] if category else full
+
+    stats_global = {
         "total": len(full),
         "by_sentiment": full["sentiment_label"].value_counts().to_dict(),
         "by_category": full["category"].value_counts().to_dict(),
         "by_source": full["source"].value_counts().head(15).to_dict(),
         "files_loaded": [p.name for p in files],
+        "override_count": int(full.get("overridden", pd.Series(dtype=bool)).sum())
+                          if "overridden" in full.columns else 0,
     }
-    return {"status": "ok", "items": items, "stats": stats}
+    stats_filtered = {
+        "total": len(df_for_kpi),
+        "by_sentiment": df_for_kpi["sentiment_label"].value_counts().to_dict(),
+    }
+
+    return {"status": "ok", "items": items,
+            "stats_global": stats_global,
+            "stats_filtered": stats_filtered,
+            # Keep `stats` for backward compatibility with anything reading the
+            # old shape.
+            "stats": stats_global}
 
 
 def _sharpe(returns: pd.Series, periods_per_year: float = 365 * 24 * 12) -> Optional[float]:

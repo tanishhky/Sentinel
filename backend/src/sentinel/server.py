@@ -15,13 +15,19 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import config as cfg
 from . import readers
+
+
+class NewsOverrideBody(BaseModel):
+    id: str
+    sentiment_label: str  # 'positive' | 'negative' | 'neutral'
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -55,7 +61,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -71,6 +77,11 @@ def create_app() -> FastAPI:
     @app.get("/api/pinsight/chain")
     def pinsight_chain():
         return readers.pinsight_latest_chain(c.pinsight_data)
+
+    @app.get("/api/pinsight/chain/full")
+    def pinsight_chain_full(top_contracts: int = 30):
+        return readers.pinsight_chain_full(c.pinsight_data,
+                                            top_contracts=top_contracts)
 
     @app.get("/api/pinsight/flags")
     def pinsight_flags(top: int = 20):
@@ -133,6 +144,14 @@ def create_app() -> FastAPI:
         return readers.driftedge_news(c.driftedge_data,
                                        category=category,
                                        sentiment=sentiment, limit=limit)
+
+    @app.post("/api/driftedge/news/override")
+    def driftedge_news_override(body: NewsOverrideBody):
+        if body.sentiment_label not in {"positive", "negative", "neutral"}:
+            raise HTTPException(status_code=400,
+                                 detail="sentiment_label must be positive/negative/neutral")
+        return readers.write_news_override(c.driftedge_data,
+                                            body.id, body.sentiment_label)
 
     @app.get("/api/logs/pinsight")
     def logs_pinsight(max_lines: int = 200):

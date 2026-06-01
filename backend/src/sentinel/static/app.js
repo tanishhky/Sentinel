@@ -361,18 +361,71 @@ function drawEquityChart(canvasId, eq) {
 
 async function renderPSChain() {
   try {
-    const d = await jget("/api/pinsight/chain");
+    const [d, full] = await Promise.all([
+      jget("/api/pinsight/chain"),
+      jget("/api/pinsight/chain/full?top_contracts=40"),
+    ]);
     if (d.status !== "ok") {
-      set(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code> or wait for Monday 9:35 ET.</div>`);
+      set(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code> or wait for the morning launchd job.</div>`);
       return;
     }
+    const haveFull = full && full.status === "ok";
+    const callPutRatio = (d.total_put_vol && d.total_call_vol)
+      ? (d.total_put_vol / d.total_call_vol).toFixed(2)
+      : "—";
     set(`
       <div class="grid grid-4" style="margin-bottom:16px">
-        ${kpi("Underlying", d.underlying)}
-        ${kpi("Spot", `$${fmt(d.underlying_price)}`)}
-        ${kpi("Expiry", d.expiry)}
-        ${kpi("Contracts", `${d.contracts} (${d.calls}C/${d.puts}P)`)}
+        ${kpi(d.underlying, `$${fmt(d.underlying_price, 2)}`, "Spot")}
+        ${kpi("Expiry", d.expiry, "(0DTE today)")}
+        ${kpi("Contracts", `${d.contracts}`, `${d.calls}C / ${d.puts}P`)}
+        ${kpi("P/C ratio", callPutRatio,
+              `${fmtInt(d.total_call_vol)}C vol · ${fmtInt(d.total_put_vol)}P vol`)}
       </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">IV SMILE · CALLS (amber) · PUTS (cyan)</div>
+          ${haveFull
+            ? '<div class="chart-wrap"><canvas id="ivSmileChart"></canvas></div>'
+            : '<div class="muted">No IV data.</div>'}
+        </div>
+        <div class="card">
+          <div class="card-title">VOL BY STRIKE · stacked CALLS + PUTS</div>
+          ${haveFull
+            ? '<div class="chart-wrap"><canvas id="volStrikeChart"></canvas></div>'
+            : '<div class="muted">No volume data.</div>'}
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">TOP CONTRACTS BY VOLUME · ${haveFull ? full.contracts.length : 0}</div>
+        ${haveFull && full.contracts.length ? `<table>
+          <thead><tr>
+            <th>Ticker</th><th>Type</th><th class="r">Strike</th>
+            <th class="r">Bid</th><th class="r">Ask</th><th class="r">Mid</th>
+            <th class="r">Vol</th><th class="r">OI</th><th class="r">V/OI</th>
+            <th class="r">IV</th><th>ITM</th>
+          </tr></thead>
+          <tbody>${full.contracts.map(c => {
+            const voi = (c.open_interest && c.volume) ? (c.volume / c.open_interest).toFixed(2) : "—";
+            const typeCls = c.type === 'put' ? 'neg' : 'pos';
+            return `<tr>
+              <td class="muted" style="font-size:10px">${c.ticker ?? '—'}</td>
+              <td class="${typeCls}">${(c.type || '—').toUpperCase()}</td>
+              <td class="r amber">${fmt(c.strike, 0)}</td>
+              <td class="r">${c.bid != null ? fmt(c.bid, 2) : '—'}</td>
+              <td class="r">${c.ask != null ? fmt(c.ask, 2) : '—'}</td>
+              <td class="r">${c.mid != null ? fmt(c.mid, 2) : '—'}</td>
+              <td class="r">${fmtInt(c.volume)}</td>
+              <td class="r muted">${fmtInt(c.open_interest)}</td>
+              <td class="r amber">${voi}</td>
+              <td class="r">${c.iv != null ? fmt(c.iv, 3) : '—'}</td>
+              <td>${c.itm ? '<span class="amber">●</span>' : '<span class="muted">○</span>'}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>` : '<div class="muted">No contract data.</div>'}
+      </div>
+
       <div class="card">
         <div class="card-title">SNAPSHOT METADATA</div>
         <table>
@@ -384,22 +437,159 @@ async function renderPSChain() {
           </tbody>
         </table>
       </div>`);
+
+    if (haveFull) {
+      drawIVSmileChart("ivSmileChart", full);
+      drawVolByStrikeChart("volStrikeChart", full);
+    }
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
 }
 
+function drawIVSmileChart(canvasId, full) {
+  const spot = full.spot;
+  mkChart(canvasId, {
+    type: "scatter",
+    data: {
+      datasets: [
+        { label: "Calls", data: full.smile.calls.map(p => ({ x: p.strike, y: p.iv })),
+          backgroundColor: "#ff9000", borderColor: "#ff9000",
+          pointRadius: 3, showLine: false },
+        { label: "Puts", data: full.smile.puts.map(p => ({ x: p.strike, y: p.iv })),
+          backgroundColor: "#00d4ff", borderColor: "#00d4ff",
+          pointRadius: 3, showLine: false },
+      ],
+    },
+    options: {
+      ...CHART_BASE,
+      plugins: {
+        ...CHART_BASE.plugins,
+        legend: { display: true, labels: { color: "#ffffff",
+                                            font: { family: "JetBrains Mono, monospace", size: 10 }}},
+        annotation: undefined,
+      },
+      scales: {
+        x: { ...CHART_BASE.scales.x, type: "linear",
+             title: { display: true, text: "STRIKE",
+                      color: "#666", font: { family: "JetBrains Mono, monospace", size: 10 }}},
+        y: { ...CHART_BASE.scales.y,
+             title: { display: true, text: "IMPLIED VOL",
+                      color: "#666", font: { family: "JetBrains Mono, monospace", size: 10 }},
+             ticks: { ...CHART_BASE.scales.y.ticks,
+                      callback: v => Number(v).toFixed(2) }},
+      },
+    },
+  });
+  // Spot line overlay (Chart.js doesn't support annotation plugin without import,
+  // so draw it manually as a thin dataset).
+  const chart = chartRegistry[canvasId];
+  if (chart && spot != null) {
+    const yMin = chart.scales.y.min;
+    const yMax = chart.scales.y.max;
+    chart.data.datasets.push({
+      label: `Spot $${spot.toFixed(2)}`,
+      data: [{ x: spot, y: yMin }, { x: spot, y: yMax }],
+      borderColor: "#ffffff", borderWidth: 1, borderDash: [4, 4],
+      pointRadius: 0, showLine: true, type: "line",
+    });
+    chart.update("none");
+  }
+}
+
+function drawVolByStrikeChart(canvasId, full) {
+  // Filter to ±15% of spot for readability — same range as the smile.
+  const spot = full.spot || 0;
+  const lo = spot * 0.85, hi = spot * 1.15;
+  const rows = full.vol_by_strike.filter(r => r.strike >= lo && r.strike <= hi);
+  mkChart(canvasId, {
+    type: "bar",
+    data: {
+      labels: rows.map(r => r.strike.toFixed(0)),
+      datasets: [
+        { label: "Calls", data: rows.map(r => r.call_vol),
+          backgroundColor: "#ff900088", borderColor: "#ff9000", borderWidth: 1,
+          stack: "vol" },
+        { label: "Puts", data: rows.map(r => r.put_vol),
+          backgroundColor: "#00d4ff88", borderColor: "#00d4ff", borderWidth: 1,
+          stack: "vol" },
+      ],
+    },
+    options: {
+      ...CHART_BASE,
+      plugins: {
+        ...CHART_BASE.plugins,
+        legend: { display: true, labels: { color: "#ffffff",
+                                            font: { family: "JetBrains Mono, monospace", size: 10 }}},
+      },
+      scales: {
+        x: { ...CHART_BASE.scales.x, stacked: true,
+             ticks: { ...CHART_BASE.scales.x.ticks,
+                      maxRotation: 0, autoSkip: true, maxTicksLimit: 12 }},
+        y: { ...CHART_BASE.scales.y, stacked: true,
+             ticks: { ...CHART_BASE.scales.y.ticks,
+                      callback: v => v >= 1000 ? (v / 1000).toFixed(0) + "k" : v }},
+      },
+    },
+  });
+}
+
+let flagFilters = { type: "", minVoi: 1, search: "" };
+
 async function renderPSFlags() {
   try {
-    const d = await jget("/api/pinsight/flags?top=30");
+    const d = await jget("/api/pinsight/flags?top=200");
     if (d.status !== "ok" || !d.items?.length) {
       set(`<div class="muted">No flagged contracts.</div>`);
       return;
     }
+    const filtered = d.items.filter(r => {
+      if (flagFilters.type && r.type !== flagFilters.type) return false;
+      if (flagFilters.minVoi != null && r.v_over_oi < flagFilters.minVoi) return false;
+      if (flagFilters.search && !`${r.underlying}${r.expiry}${r.strike}`.toLowerCase()
+          .includes(flagFilters.search.toLowerCase())) return false;
+      return true;
+    });
+    const totalCalls = d.items.filter(r => r.type === 'call').length;
+    const totalPuts = d.items.filter(r => r.type === 'put').length;
+    const topVoi = d.items.length ? Math.max(...d.items.map(r => r.v_over_oi)) : 0;
+
     set(`
-      <div class="muted mono" style="margin-bottom:12px">
-        ${d.count} flagged contracts (vol/OI ≥ 1, volume ≥ 1000)
+      <div class="grid grid-4" style="margin-bottom:12px">
+        ${kpi("Flagged", d.count, "vol/OI ≥ 1 · vol ≥ 1000")}
+        ${kpi("Calls / Puts", `<span class="pos">${totalCalls}</span> / <span class="neg">${totalPuts}</span>`)}
+        ${kpi("Top V/OI", fmt(topVoi, 1) + "×")}
+        ${kpi("Showing", `${filtered.length} / ${d.items.length}`, "post-filter")}
       </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">VOL/OI DISTRIBUTION (log-bins)</div>
+        <div class="chart-wrap"><canvas id="voiDistChart"></canvas></div>
+      </div>
+
+      <div class="news-filter-bar" style="margin-bottom:12px">
+        <span class="muted mono" style="font-size:10px">Filter:</span>
+        <select id="flagTypeFilter">
+          <option value="" ${!flagFilters.type ? 'selected' : ''}>All types</option>
+          <option value="call" ${flagFilters.type === 'call' ? 'selected' : ''}>Calls</option>
+          <option value="put"  ${flagFilters.type === 'put'  ? 'selected' : ''}>Puts</option>
+        </select>
+        <select id="flagVoiFilter">
+          <option value="1"   ${flagFilters.minVoi == 1   ? 'selected' : ''}>Min V/OI 1×</option>
+          <option value="5"   ${flagFilters.minVoi == 5   ? 'selected' : ''}>Min V/OI 5×</option>
+          <option value="20"  ${flagFilters.minVoi == 20  ? 'selected' : ''}>Min V/OI 20×</option>
+          <option value="100" ${flagFilters.minVoi == 100 ? 'selected' : ''}>Min V/OI 100×</option>
+        </select>
+        <input id="flagSearch" type="text" placeholder="search strike/symbol…"
+               value="${flagFilters.search}"
+               style="background:var(--bg-2);border:1px solid var(--border);
+                      color:var(--text);padding:4px 8px;font-family:var(--mono);
+                      font-size:11px;min-width:160px">
+        <span class="muted mono" style="font-size:10px;margin-left:auto">
+          ${filtered.length} of ${d.items.length}
+        </span>
+      </div>
+
       <table>
         <thead><tr>
           <th>Underlying</th><th>Expiry</th><th>Type</th>
@@ -407,21 +597,82 @@ async function renderPSFlags() {
           <th class="r">Vol/OI</th><th class="r">IV</th>
         </tr></thead>
         <tbody>
-          ${d.items.map(r => `<tr>
+          ${filtered.map(r => `<tr>
             <td class="amber">${r.underlying}</td>
             <td>${r.expiry}</td>
             <td class="${r.type === 'put' ? 'neg' : 'pos'}">${r.type}</td>
             <td class="r">${fmt(r.strike, 0)}</td>
             <td class="r">${fmtInt(r.volume)}</td>
             <td class="r">${fmtInt(r.open_interest)}</td>
-            <td class="r amber">${r.v_over_oi}</td>
+            <td class="r amber">${fmt(r.v_over_oi, 2)}</td>
             <td class="r">${r.iv != null ? fmt(r.iv, 3) : '—'}</td>
           </tr>`).join('')}
         </tbody>
       </table>`);
+
+    drawVoiHistChart("voiDistChart", d.items);
+
+    document.getElementById("flagTypeFilter").addEventListener("change", e => {
+      flagFilters.type = e.target.value; renderPSFlags();
+    });
+    document.getElementById("flagVoiFilter").addEventListener("change", e => {
+      flagFilters.minVoi = Number(e.target.value); renderPSFlags();
+    });
+    document.getElementById("flagSearch").addEventListener("input", e => {
+      flagFilters.search = e.target.value;
+      // Debounce by skipping re-render until 250ms idle.
+      clearTimeout(window._flagSearchTimer);
+      window._flagSearchTimer = setTimeout(() => renderPSFlags(), 250);
+    });
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
+}
+
+function drawVoiHistChart(canvasId, items) {
+  // Log-bins: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000
+  const edges = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000];
+  const labels = [];
+  for (let i = 0; i < edges.length - 1; i++) {
+    labels.push(`${edges[i]}–${edges[i+1]}×`);
+  }
+  const calls = new Array(edges.length - 1).fill(0);
+  const puts = new Array(edges.length - 1).fill(0);
+  for (const r of items) {
+    for (let i = 0; i < edges.length - 1; i++) {
+      if (r.v_over_oi >= edges[i] && r.v_over_oi < edges[i + 1]) {
+        if (r.type === 'put') puts[i]++; else calls[i]++;
+        break;
+      }
+    }
+  }
+  mkChart(canvasId, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: "Calls", data: calls,
+          backgroundColor: "#ff900088", borderColor: "#ff9000", borderWidth: 1,
+          stack: "voi" },
+        { label: "Puts", data: puts,
+          backgroundColor: "#00d4ff88", borderColor: "#00d4ff", borderWidth: 1,
+          stack: "voi" },
+      ],
+    },
+    options: {
+      ...CHART_BASE,
+      plugins: {
+        ...CHART_BASE.plugins,
+        legend: { display: true, labels: { color: "#ffffff",
+                                            font: { family: "JetBrains Mono, monospace", size: 10 }}},
+      },
+      scales: {
+        x: { ...CHART_BASE.scales.x, stacked: true },
+        y: { ...CHART_BASE.scales.y, stacked: true, beginAtZero: true,
+             ticks: { ...CHART_BASE.scales.y.ticks, precision: 0, stepSize: 1 }},
+      },
+    },
+  });
 }
 
 async function renderDEPaper() {
@@ -874,23 +1125,27 @@ async function renderDENews() {
       set(`<div class="muted">No news yet. Run <code>driftedge fetch-news</code> or wait for the daemon's 15-minute sweep.</div>`);
       return;
     }
-    const s = d.stats;
-    const cats = Object.keys(s.by_category || {}).sort();
-    const sources = Object.keys(s.by_source || {}).sort();
+    const sG = d.stats_global || d.stats || {};
+    const sF = d.stats_filtered || sG;
+    const cats = Object.keys(sG.by_category || {}).sort();
+    const filterLabel = newsFilter.category ? `· ${newsFilter.category.toUpperCase()}` : "· ALL";
 
     set(`
       <div class="grid grid-4" style="margin-bottom:12px">
-        ${kpi("Total items", s.total)}
-        ${kpi("Positive", `<span class="pos">${s.by_sentiment?.positive ?? 0}</span>`)}
-        ${kpi("Negative", `<span class="neg">${s.by_sentiment?.negative ?? 0}</span>`)}
-        ${kpi("Neutral", `<span class="muted">${s.by_sentiment?.neutral ?? 0}</span>`)}
+        ${kpi("Items " + filterLabel, sF.total ?? 0, `of ${sG.total ?? 0} total`)}
+        ${kpi("Positive", `<span class="pos">${sF.by_sentiment?.positive ?? 0}</span>`,
+              `${pctOf(sF.by_sentiment?.positive, sF.total)}% of shown`)}
+        ${kpi("Negative", `<span class="neg">${sF.by_sentiment?.negative ?? 0}</span>`,
+              `${pctOf(sF.by_sentiment?.negative, sF.total)}% of shown`)}
+        ${kpi("Neutral", `<span class="muted">${sF.by_sentiment?.neutral ?? 0}</span>`,
+              `${pctOf(sF.by_sentiment?.neutral, sF.total)}% of shown`)}
       </div>
 
       <div class="news-filter-bar">
         <span class="muted mono" style="font-size:10px">Filter:</span>
         <select id="catFilter">
           <option value="">All categories</option>
-          ${cats.map(c => `<option value="${c}" ${newsFilter.category===c?'selected':''}>${c.toUpperCase()} (${s.by_category[c]})</option>`).join('')}
+          ${cats.map(c => `<option value="${c}" ${newsFilter.category===c?'selected':''}>${c.toUpperCase()} (${sG.by_category[c]})</option>`).join('')}
         </select>
         <select id="sentFilter">
           <option value="">All sentiment</option>
@@ -898,7 +1153,9 @@ async function renderDENews() {
           <option value="negative" ${newsFilter.sentiment==='negative'?'selected':''}>NEGATIVE</option>
           <option value="neutral"  ${newsFilter.sentiment==='neutral'?'selected':''}>NEUTRAL</option>
         </select>
-        <span class="muted mono" style="font-size:10px;margin-left:auto">Showing ${d.items.length} of ${s.total}</span>
+        <span class="muted mono" style="font-size:10px;margin-left:auto">
+          Showing ${d.items.length} · ${sG.override_count || 0} manual overrides
+        </span>
       </div>
 
       <div class="card" style="padding:0">
@@ -909,12 +1166,17 @@ async function renderDENews() {
           const sc = it.sentiment_score;
           const cls = `sent-${it.sentiment_label}`;
           const sign = sc >= 0 ? "+" : "";
-          const arrow = sc > 0.2 ? "▲" : sc < -0.2 ? "▼" : "■";
+          const arrow = it.sentiment_label === "positive" ? "▲" :
+                        it.sentiment_label === "negative" ? "▼" : "■";
+          const mark = it.overridden ? '<span class="amber" title="manual override">✎</span>' : "";
           return `<div class="news-row">
             <span class="news-time">${fmtTimeLocal(it.published_ts)}</span>
             <span class="news-cat">${(it.category || '—').toUpperCase()}</span>
             <span class="news-source">${(it.source || '—').replace('reddit:', 'r/').slice(0,18)}</span>
-            <span class="news-sent ${cls}">${arrow} ${sign}${sc.toFixed(2)}</span>
+            <span class="news-sent ${cls} sent-clickable" data-id="${it.id}"
+                  title="click to override sentiment">
+              ${mark}${arrow} ${sign}${sc.toFixed(2)}
+            </span>
             <span class="news-headline"><a href="${it.url}" target="_blank" rel="noopener">${it.headline}</a></span>
           </div>`;
         }).join('')}
@@ -929,9 +1191,67 @@ async function renderDENews() {
       newsFilter.sentiment = e.target.value;
       renderDENews();
     });
+
+    document.querySelectorAll(".sent-clickable").forEach(el => {
+      el.style.cursor = "pointer";
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openSentimentOverridePopup(el);
+      });
+    });
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
+}
+
+function pctOf(n, total) {
+  if (!total || !n) return "0";
+  return ((n / total) * 100).toFixed(0);
+}
+
+function openSentimentOverridePopup(anchorEl) {
+  // Remove any existing popup
+  document.querySelectorAll(".sent-popup").forEach(n => n.remove());
+  const id = anchorEl.dataset.id;
+  const rect = anchorEl.getBoundingClientRect();
+  const pop = document.createElement("div");
+  pop.className = "sent-popup";
+  pop.style.cssText = `position:fixed; top:${rect.bottom + 4}px; left:${rect.left}px;
+    background:var(--bg-2); border:1px solid var(--primary); padding:6px;
+    z-index:9999; font-family:var(--mono); font-size:11px; display:flex; gap:4px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.6);`;
+  pop.innerHTML = `
+    <button data-v="positive" class="pos" style="background:transparent;border:1px solid #00ff88;color:#00ff88;padding:3px 8px;cursor:pointer;font-family:var(--mono);font-size:11px">▲ POS</button>
+    <button data-v="neutral"  style="background:transparent;border:1px solid #666;color:#aaa;padding:3px 8px;cursor:pointer;font-family:var(--mono);font-size:11px">■ NEU</button>
+    <button data-v="negative" class="neg" style="background:transparent;border:1px solid #ff4444;color:#ff4444;padding:3px 8px;cursor:pointer;font-family:var(--mono);font-size:11px">▼ NEG</button>
+    <button data-v="cancel" style="background:transparent;border:1px solid #666;color:#666;padding:3px 8px;cursor:pointer;font-family:var(--mono);font-size:11px">×</button>
+  `;
+  document.body.appendChild(pop);
+  pop.querySelectorAll("button").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      const v = btn.dataset.v;
+      pop.remove();
+      if (v === "cancel") return;
+      try {
+        const r = await fetch("/api/driftedge/news/override", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, sentiment_label: v }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        renderDENews();
+      } catch (err) {
+        alert("Override failed: " + err.message);
+      }
+    });
+  });
+  // Click-away to close
+  setTimeout(() => {
+    document.addEventListener("click", function closer(ev) {
+      if (!pop.contains(ev.target)) { pop.remove();
+        document.removeEventListener("click", closer); }
+    });
+  }, 50);
 }
 
 // ──────────────── MARKET DETAIL MODAL ────────────────
