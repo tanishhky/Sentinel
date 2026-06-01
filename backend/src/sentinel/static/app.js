@@ -268,6 +268,64 @@ async function renderDashboard() {
   }
 }
 
+function drawHistogramChart(canvasId, dist, color) {
+  if (!dist || dist.status !== "ok") return;
+  const edges = dist.bins;
+  const labels = [];
+  for (let i = 0; i < edges.length - 1; i++) {
+    labels.push(((edges[i] + edges[i + 1]) / 2).toFixed(2));
+  }
+  const ctx = document.getElementById(canvasId);
+  if (!ctx) return;
+  mkChart(canvasId, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: "Trades",
+        data: dist.counts,
+        backgroundColor: color || "#ff9000",
+        borderColor: color || "#ff9000",
+        borderWidth: 1,
+        categoryPercentage: 1.0,
+        barPercentage: 1.0,
+      }],
+    },
+    options: {
+      ...CHART_BASE,
+      plugins: {
+        ...CHART_BASE.plugins,
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          ...CHART_BASE.scales.x,
+          ticks: {
+            ...CHART_BASE.scales.x.ticks,
+            maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 12,
+            callback: function (v) {
+              const lab = this.getLabelForValue(v);
+              return (parseFloat(lab) >= 0 ? "+" : "") + lab;
+            },
+          },
+          grid: { color: "#1a1a1a" },
+        },
+        y: {
+          ...CHART_BASE.scales.y,
+          beginAtZero: true,
+          ticks: {
+            ...CHART_BASE.scales.y.ticks,
+            stepSize: 1,
+            precision: 0,
+          },
+        },
+      },
+    },
+  });
+}
+
 function drawEquityChart(canvasId, eq) {
   if (eq.status !== "ok") return;
   const datasets = [];
@@ -368,10 +426,15 @@ async function renderPSFlags() {
 
 async function renderDEPaper() {
   try {
-    const [d, eq] = await Promise.all([
+    const [d, eq, risk, distK, distE, distV] = await Promise.all([
       jget("/api/driftedge/paper"),
       jget("/api/driftedge/paper/equity-history"),
+      jget("/api/driftedge/paper/risk-stats"),
+      jget("/api/driftedge/paper/pnl-distribution?trader=kelly"),
+      jget("/api/driftedge/paper/pnl-distribution?trader=equal"),
+      jget("/api/driftedge/paper/pnl-distribution?trader=volwt"),
     ]);
+    const dists = { kelly: distK, equal: distE, volwt: distV };
     if (d.status !== "ok") {
       set(`<div class="muted">No paper trades yet.</div>`);
       return;
@@ -436,8 +499,25 @@ async function renderDEPaper() {
       <div class="grid grid-3" style="margin-bottom:16px">${traderCards}</div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">EQUITY CURVE · 3-TRADER HORSE RACE</div>
+        <div class="card-title">EQUITY CURVE · 3-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(continuous MTM, updates every tick)</span></div>
         <div class="chart-wrap tall"><canvas id="paperEquityChart"></canvas></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">RISK STATS · MTM-DERIVED</div>
+        ${renderRiskPanel(risk)}
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">P&L DISTRIBUTION PER TRADER <span class="muted" style="font-weight:normal;font-size:10px">(realized closed trades — test for normality / fat tails)</span></div>
+        <div class="grid grid-3">
+          ${["kelly", "equal", "volwt"].map(t => `
+            <div>
+              <div class="muted mono" style="font-size:10px;margin-bottom:4px;color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
+              ${renderDistMeta(dists[t])}
+              <div class="chart-wrap"><canvas id="distChart_${t}"></canvas></div>
+            </div>`).join("")}
+        </div>
       </div>
 
       <div class="grid grid-2" style="margin-bottom:16px">
@@ -536,9 +616,63 @@ async function renderDEPaper() {
     });
 
     drawEquityChart("paperEquityChart", eq);
+    for (const t of ["kelly", "equal", "volwt"]) {
+      drawHistogramChart(`distChart_${t}`, dists[t], TRADER_COLORS[t]);
+    }
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
+}
+
+function renderRiskPanel(risk) {
+  if (!risk || risk.status !== "ok") {
+    return '<div class="muted">No risk-history yet — needs a few ticks of paper engine activity.</div>';
+  }
+  const TRADERS = ["kelly", "equal", "volwt"];
+  const cells = TRADERS.map(t => {
+    const r = risk.by_trader[t] || {};
+    const retCls = signClass(r.total_return_pct);
+    const ddCls = (r.max_drawdown_pct ?? 0) > 5 ? "neg" : "muted";
+    const sharpe = r.sharpe;
+    const sharpeCls = sharpe == null ? "muted" : (sharpe > 0 ? "pos" : "neg");
+    return `<div>
+      <div class="muted mono" style="font-size:10px;color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 12px;font-family:var(--mono);font-size:11px;margin-top:6px">
+        <div><span class="muted">Return:</span> <span class="${retCls}">${r.total_return_pct != null ? signFmt(r.total_return_pct, 3) + "%" : "—"}</span></div>
+        <div><span class="muted">Equity:</span> <span>$${fmt(r.current_equity ?? 0, 2)}</span></div>
+        <div><span class="muted">Max DD:</span> <span class="${ddCls}">-${fmt(r.max_drawdown_pct ?? 0, 2)}%</span></div>
+        <div><span class="muted">Cur DD:</span> <span>-${fmt(r.current_drawdown_pct ?? 0, 2)}%</span></div>
+        <div><span class="muted">Sharpe:</span> <span class="${sharpeCls}">${sharpe != null ? fmt(sharpe, 2) : "—"}</span></div>
+        <div><span class="muted">Sortino:</span> <span>${r.sortino != null ? fmt(r.sortino, 2) : "—"}</span></div>
+        <div><span class="muted">Hit rate:</span> <span>${r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
+        <div><span class="muted">PF:</span> <span>${r.profit_factor != null ? fmt(r.profit_factor, 2) : "—"}</span></div>
+        <div><span class="muted">Avg win:</span> <span class="pos">$${fmt(r.avg_win_usd ?? 0, 2)}</span></div>
+        <div><span class="muted">Avg loss:</span> <span class="neg">$${fmt(r.avg_loss_usd ?? 0, 2)}</span></div>
+        <div><span class="muted">Snaps:</span> <span>${r.snapshots ?? 0}</span></div>
+        <div><span class="muted">Closed:</span> <span>${r.closed_trades ?? 0}</span></div>
+      </div>
+    </div>`;
+  }).join("");
+  return `<div class="grid grid-3">${cells}</div>`;
+}
+
+function renderDistMeta(dist) {
+  if (!dist || dist.status !== "ok") {
+    return '<div class="muted mono" style="font-size:10px">No closed trades yet.</div>';
+  }
+  const m = dist.moments || {};
+  const skewCls = (m.skew ?? 0) > 0 ? "pos" : (m.skew ?? 0) < 0 ? "neg" : "muted";
+  const skewLabel = Math.abs(m.skew ?? 0) < 0.3 ? "symmetric" :
+                    (m.skew > 0 ? "right-tail" : "left-tail");
+  const fatTail = (m.kurtosis ?? 0) > 1 ? "FAT" : "normal-ish";
+  return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;font-family:var(--mono);font-size:10px;margin-bottom:4px">
+    <div><span class="muted">n:</span> ${dist.n}</div>
+    <div><span class="muted">+share:</span> ${(dist.positive_share * 100).toFixed(0)}%</div>
+    <div><span class="muted">μ:</span> $${signFmt(m.mean ?? 0, 2)}</div>
+    <div><span class="muted">σ:</span> $${fmt(m.std ?? 0, 2)}</div>
+    <div><span class="muted">skew:</span> <span class="${skewCls}">${m.skew != null ? fmt(m.skew, 2) : "—"}</span> (${skewLabel})</div>
+    <div><span class="muted">kurt:</span> ${m.kurtosis != null ? fmt(m.kurtosis, 2) : "—"} (${fatTail})</div>
+  </div>`;
 }
 
 async function renderDEMarkets() {
@@ -821,7 +955,10 @@ async function openMarketDetail(venue, marketId) {
   document.body.appendChild(back);
 
   try {
-    const d = await jget(`/api/driftedge/market/${venue}/${encodeURIComponent(marketId)}`);
+    const [d, mDist] = await Promise.all([
+      jget(`/api/driftedge/market/${venue}/${encodeURIComponent(marketId)}`),
+      jget(`/api/driftedge/paper/pnl-distribution?venue=${encodeURIComponent(venue)}&market_id=${encodeURIComponent(marketId)}&bins=15`),
+    ]);
     if (d.status === "no_data") {
       document.getElementById("modalBody").innerHTML = '<div class="muted">No data for this market in our archive.</div>';
       return;
@@ -846,6 +983,12 @@ async function openMarketDetail(venue, marketId) {
           ? '<div class="chart-wrap tall"><canvas id="detailHistChart"></canvas></div>'
           : '<div class="muted">No orderbook snapshots archived for this market yet.</div>'}
       </div>
+      <div class="card" style="margin-bottom:14px">
+        <div class="card-title">P&L DISTRIBUTION ON THIS MARKET</div>
+        ${mDist && mDist.status === "ok"
+          ? renderDistMeta(mDist) + '<div class="chart-wrap"><canvas id="detailDistChart"></canvas></div>'
+          : '<div class="muted">No realized P&L on this market yet.</div>'}
+      </div>
       ${d.trades.length ? `
         <div class="card">
           <div class="card-title">PAPER TRADES ON THIS MARKET (${d.trades.length})</div>
@@ -869,6 +1012,9 @@ async function openMarketDetail(venue, marketId) {
     `;
     document.getElementById("modalBody").innerHTML = html;
 
+    if (mDist && mDist.status === "ok") {
+      drawHistogramChart("detailDistChart", mDist, "#ff9000");
+    }
     if (histCount > 0) {
       const ctx = document.getElementById("detailHistChart").getContext("2d");
       modalChart = new Chart(ctx, {

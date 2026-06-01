@@ -92,6 +92,19 @@ def create_app() -> FastAPI:
     def driftedge_equity_history():
         return readers.driftedge_equity_history(c.driftedge_data)
 
+    @app.get("/api/driftedge/paper/risk-stats")
+    def driftedge_risk_stats():
+        return readers.driftedge_risk_stats(c.driftedge_data)
+
+    @app.get("/api/driftedge/paper/pnl-distribution")
+    def driftedge_pnl_distribution(trader: Optional[str] = None,
+                                    venue: Optional[str] = None,
+                                    market_id: Optional[str] = None,
+                                    bins: int = 25):
+        return readers.driftedge_pnl_distribution(
+            c.driftedge_data, trader=trader, venue=venue,
+            market_id=market_id, bins=bins)
+
     @app.get("/api/driftedge/price-distribution")
     def driftedge_price_distribution():
         return readers.driftedge_price_distribution(c.driftedge_data)

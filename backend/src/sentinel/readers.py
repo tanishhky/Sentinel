@@ -306,16 +306,47 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
 
 
 def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
-    """Compute equity time series per trader from closed trades, then
-    extend the line to NOW by marking open positions to market via the
-    most recent orderbook snapshot for each open market.
+    """Per-trader equity time series.
 
-    Equity(t) = bankroll_init + sum(pnl_usd for closed trades exit_ts <= t)
-              + mark-to-market(open positions @ t)
-    The final point is at datetime.now() so the chart never looks 'stuck'.
+    Primary source: ``equity_history.parquet`` (continuous MTM written every
+    paper-engine tick). Falls back to reconstructing from ``paper_trades``
+    + a live-mid extrapolation when the new file isn't there yet.
     """
-    trades_path = data_dir / "paper_trades.parquet"
+    equity_path = data_dir / "equity_history.parquet"
     state_path = data_dir / "paper_state.parquet"
+
+    # ── Primary path: continuous MTM file written by paper.tick ──
+    if equity_path.exists():
+        try:
+            edf = pd.read_parquet(equity_path)
+        except Exception as exc:
+            return {"status": "error", "err": str(exc)}
+        if not edf.empty and "trader" in edf.columns:
+            bankrolls: dict[str, float] = {}
+            if state_path.exists():
+                try:
+                    st = pd.read_parquet(state_path)
+                    for _, r in st.iterrows():
+                        bankrolls[str(r["trader"])] = float(r["bankroll_init"])
+                except Exception:
+                    pass
+
+            series: dict[str, list[dict[str, Any]]] = {}
+            for trader, grp in edf.groupby("trader"):
+                grp = grp.sort_values("ts")
+                series[str(trader)] = [
+                    {"ts": str(r["ts"]),
+                     "equity": round(float(r["total_equity_usd"]), 2),
+                     "drawdown_pct": round(float(r["drawdown_pct"]), 3),
+                     "mtm": round(float(r["mtm_unrealized_usd"]), 2)}
+                    for _, r in grp.iterrows()
+                ]
+            return {"status": "ok", "series": series,
+                    "bankrolls": bankrolls or {"kelly": 10000, "equal": 10000, "volwt": 10000},
+                    "source": "equity_history"}
+
+    # ── Fallback: reconstruct from trades when no equity_history yet ──
+    trades_path = data_dir / "paper_trades.parquet"
     if not trades_path.exists():
         return {"status": "no_data"}
     try:
@@ -658,6 +689,196 @@ def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
         "files_loaded": [p.name for p in files],
     }
     return {"status": "ok", "items": items, "stats": stats}
+
+
+def _sharpe(returns: pd.Series, periods_per_year: float = 365 * 24 * 12) -> Optional[float]:
+    """Naive annualised Sharpe. periods_per_year defaults to 5-min ticks.
+
+    The exact annualisation factor is approximate (depends on actual tick
+    cadence) but it's stable across traders so cross-trader comparison is
+    meaningful even if the absolute value is fuzzy.
+    """
+    if returns.empty or returns.std(ddof=0) == 0:
+        return None
+    return round(float(returns.mean() / returns.std(ddof=0) * (periods_per_year ** 0.5)), 3)
+
+
+def _sortino(returns: pd.Series, periods_per_year: float = 365 * 24 * 12) -> Optional[float]:
+    if returns.empty:
+        return None
+    downside = returns[returns < 0]
+    if downside.empty or downside.std(ddof=0) == 0:
+        return None
+    return round(float(returns.mean() / downside.std(ddof=0) * (periods_per_year ** 0.5)), 3)
+
+
+def _moments(values: list[float]) -> dict[str, Optional[float]]:
+    """Mean / std / skew / kurtosis. Returns None when undefined."""
+    if len(values) < 2:
+        return {"mean": (round(values[0], 4) if values else None),
+                "std": None, "skew": None, "kurtosis": None,
+                "min": (values[0] if values else None),
+                "max": (values[0] if values else None)}
+    s = pd.Series(values, dtype=float)
+    return {
+        "mean": round(float(s.mean()), 4),
+        "std": round(float(s.std(ddof=0)), 4),
+        "skew": (round(float(s.skew()), 4) if len(s) >= 3 else None),
+        "kurtosis": (round(float(s.kurt()), 4) if len(s) >= 4 else None),
+        "min": round(float(s.min()), 4),
+        "max": round(float(s.max()), 4),
+    }
+
+
+def driftedge_risk_stats(data_dir: Path) -> dict[str, Any]:
+    """Per-trader risk panel: drawdown, Sharpe, win rate, profit factor.
+
+    Drawdown / Sharpe / Sortino derive from ``equity_history.parquet`` (the
+    continuous MTM record). Hit rate / profit factor / avg-win / avg-loss
+    derive from realized trades in ``paper_trades.parquet``.
+    """
+    equity_path = data_dir / "equity_history.parquet"
+    trades_path = data_dir / "paper_trades.parquet"
+
+    out_by_trader: dict[str, dict[str, Any]] = {}
+
+    eq: pd.DataFrame = pd.DataFrame()
+    if equity_path.exists():
+        try:
+            eq = pd.read_parquet(equity_path)
+        except Exception:
+            eq = pd.DataFrame()
+
+    trades: pd.DataFrame = pd.DataFrame()
+    if trades_path.exists():
+        try:
+            trades = pd.read_parquet(trades_path)
+        except Exception:
+            trades = pd.DataFrame()
+
+    traders = set()
+    if not eq.empty and "trader" in eq.columns:
+        traders.update(eq["trader"].dropna().unique())
+    if not trades.empty and "trader" in trades.columns:
+        traders.update(trades["trader"].dropna().unique())
+
+    for trader in sorted(traders):
+        row: dict[str, Any] = {"trader": trader}
+
+        # ── Equity-derived metrics ──
+        if not eq.empty:
+            grp = eq[eq["trader"] == trader].sort_values("ts").copy()
+            if not grp.empty:
+                grp["ret"] = grp["total_equity_usd"].pct_change().fillna(0.0)
+                peak = grp["total_equity_usd"].cummax()
+                dd = (peak - grp["total_equity_usd"]) / peak.replace(0, float("nan"))
+                row.update({
+                    "snapshots": int(len(grp)),
+                    "first_ts": str(grp["ts"].iloc[0]),
+                    "last_ts": str(grp["ts"].iloc[-1]),
+                    "start_equity": round(float(grp["total_equity_usd"].iloc[0]), 2),
+                    "current_equity": round(float(grp["total_equity_usd"].iloc[-1]), 2),
+                    "peak_equity": round(float(grp["peak_equity_usd"].iloc[-1]), 2),
+                    "current_drawdown_pct": round(float(grp["drawdown_pct"].iloc[-1]), 3),
+                    "max_drawdown_pct": round(float(dd.max() * 100), 3) if not dd.empty else None,
+                    "total_return_pct": round(
+                        (float(grp["total_equity_usd"].iloc[-1])
+                         / float(grp["total_equity_usd"].iloc[0]) - 1) * 100, 3),
+                    "sharpe": _sharpe(grp["ret"]),
+                    "sortino": _sortino(grp["ret"]),
+                    "vol_pct": round(float(grp["ret"].std(ddof=0) * 100), 4),
+                })
+
+        # ── Trade-derived metrics ──
+        if not trades.empty:
+            t_df = trades[trades["trader"] == trader]
+            t_closed = t_df[t_df["status"] != "open"] if not t_df.empty else t_df
+            if not t_closed.empty:
+                pnl = t_closed["pnl_usd"].fillna(0)
+                wins = pnl[pnl > 0]
+                losses = pnl[pnl < 0]
+                row.update({
+                    "closed_trades": int(len(t_closed)),
+                    "wins": int(len(wins)),
+                    "losses": int(len(losses)),
+                    "hit_rate": (round(float(len(wins) / len(t_closed)), 4)
+                                  if len(t_closed) else None),
+                    "avg_win_usd": round(float(wins.mean()), 4) if not wins.empty else 0.0,
+                    "avg_loss_usd": round(float(losses.mean()), 4) if not losses.empty else 0.0,
+                    "profit_factor": (round(float(wins.sum() / abs(losses.sum())), 3)
+                                       if not losses.empty and losses.sum() != 0 else None),
+                    "total_realized_pnl_usd": round(float(pnl.sum()), 2),
+                })
+
+        out_by_trader[trader] = row
+
+    return {"status": "ok" if out_by_trader else "no_data",
+            "by_trader": out_by_trader,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def driftedge_pnl_distribution(data_dir: Path, *,
+                                trader: Optional[str] = None,
+                                venue: Optional[str] = None,
+                                market_id: Optional[str] = None,
+                                bins: int = 25) -> dict[str, Any]:
+    """Histogram + moments of realized P&L.
+
+    Filters:
+      * trader      — restrict to one paper trader
+      * venue       — restrict to one venue
+      * market_id   — restrict to a single market (used by the modal)
+
+    Returns histogram bin edges + counts plus (mean, std, skew, kurtosis,
+    min, max) so the UI can render a chart AND a one-line normality
+    diagnostic.
+    """
+    trades_path = data_dir / "paper_trades.parquet"
+    if not trades_path.exists():
+        return {"status": "no_data"}
+    try:
+        df = pd.read_parquet(trades_path)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty:
+        return {"status": "no_data"}
+
+    df = df[df["status"] != "open"]
+    if trader:
+        df = df[df["trader"] == trader]
+    if venue:
+        df = df[df.get("venue") == venue]
+    if market_id:
+        df = df[df.get("market_id") == market_id]
+
+    pnls = df["pnl_usd"].dropna().astype(float).tolist()
+    if not pnls:
+        return {"status": "no_data", "filter": {"trader": trader,
+                                                  "venue": venue,
+                                                  "market_id": market_id}}
+
+    # Symmetric bins around zero so normality is visually obvious.
+    bound = max(abs(min(pnls)), abs(max(pnls)), 1e-6)
+    step = (2 * bound) / bins
+    edges = [round(-bound + i * step, 4) for i in range(bins + 1)]
+    counts = [0] * bins
+    for v in pnls:
+        idx = min(int((v + bound) / step), bins - 1) if step > 0 else 0
+        if idx < 0:
+            idx = 0
+        counts[idx] += 1
+
+    moments = _moments(pnls)
+    return {
+        "status": "ok",
+        "filter": {"trader": trader, "venue": venue, "market_id": market_id},
+        "n": len(pnls),
+        "bins": edges,
+        "counts": counts,
+        "moments": moments,
+        "positive_share": round(sum(1 for v in pnls if v > 0) / len(pnls), 4),
+        "negative_share": round(sum(1 for v in pnls if v < 0) / len(pnls), 4),
+    }
 
 
 def driftedge_active_books(data_dir: Path) -> dict[str, Any]:
