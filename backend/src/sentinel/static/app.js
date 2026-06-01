@@ -57,7 +57,7 @@ function init() {
 
   const clock = document.getElementById("clock");
   setInterval(() => {
-    clock.textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + "Z";
+    clock.textContent = fmtTsLocal(new Date()) + " ET";
   }, 1000);
 
   rerender();
@@ -101,6 +101,31 @@ async function jget(path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
+}
+
+// ───── Timezone helpers — storage is UTC, display is America/New_York ─────
+const TZ = "America/New_York";
+
+function fmtTsLocal(d) {
+  // YYYY-MM-DD HH:MM:SS in ET
+  if (!(d instanceof Date)) d = new Date(d);
+  if (isNaN(d.getTime())) return "—";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(d);
+  const p = Object.fromEntries(parts.map(x => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+
+function fmtTimeLocal(d) {
+  // HH:MM:SS in ET (for table cells)
+  if (!(d instanceof Date)) d = new Date(d);
+  if (isNaN(d.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: TZ, hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false,
+  }).format(d);
 }
 
 function set(html) {
@@ -372,12 +397,56 @@ async function renderDEPaper() {
       </div>`;
     }).join("");
 
+    const categoryRows = Object.entries(s.by_category || {})
+      .sort((a, b) => (b[1].closed ?? 0) - (a[1].closed ?? 0))
+      .map(([cat, cs]) => {
+        const cls = signClass(cs.pnl_usd);
+        return `<tr>
+          <td class="amber">${cat.toUpperCase()}</td>
+          <td class="r">${cs.total}</td>
+          <td class="r">${cs.open}</td>
+          <td class="r">${cs.closed}</td>
+          <td class="r">${cs.hit_rate != null ? (cs.hit_rate * 100).toFixed(1) + "%" : "—"}</td>
+          <td class="r">${cs.avg_pnl != null ? '$' + signFmt(cs.avg_pnl, 2) : "—"}</td>
+          <td class="r ${cls}">$${signFmt(cs.pnl_usd, 2)}</td>
+        </tr>`;
+      }).join("");
+
+    const venueSummaryRows = Object.entries(s.by_venue || {}).map(([v, vs]) => {
+      const cls = signClass(vs.pnl_usd);
+      return `<tr>
+        <td class="amber">${v.toUpperCase()}</td>
+        <td class="r">${vs.total}</td>
+        <td class="r">${vs.open}</td>
+        <td class="r">${vs.closed}</td>
+        <td class="r">${vs.hit_rate != null ? (vs.hit_rate * 100).toFixed(1) + "%" : "—"}</td>
+        <td class="r ${cls}">$${signFmt(vs.pnl_usd, 2)}</td>
+      </tr>`;
+    }).join("");
+
     set(`
       <div class="grid grid-3" style="margin-bottom:16px">${traderCards}</div>
 
       <div class="card" style="margin-bottom:16px">
         <div class="card-title">EQUITY CURVE · 3-TRADER HORSE RACE</div>
         <div class="chart-wrap tall"><canvas id="paperEquityChart"></canvas></div>
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">BY VENUE</div>
+          ${venueSummaryRows ? `<table>
+            <thead><tr><th>Venue</th><th class="r">Total</th><th class="r">Open</th><th class="r">Closed</th><th class="r">Hit</th><th class="r">P&L</th></tr></thead>
+            <tbody>${venueSummaryRows}</tbody>
+          </table>` : '<div class="muted">No data.</div>'}
+        </div>
+        <div class="card">
+          <div class="card-title">BY CATEGORY (diagnostic)</div>
+          ${categoryRows ? `<table>
+            <thead><tr><th>Category</th><th class="r">Total</th><th class="r">Open</th><th class="r">Closed</th><th class="r">Hit</th><th class="r">Avg</th><th class="r">P&L</th></tr></thead>
+            <tbody>${categoryRows}</tbody>
+          </table>` : '<div class="muted">No category data yet.</div>'}
+        </div>
       </div>
 
       <div class="card" style="margin-bottom:16px">
@@ -396,7 +465,7 @@ async function renderDEPaper() {
             <td class="r">$${fmt(r.size_usd ?? 0, 2)}</td>
             <td class="r pos">${fmt(r.target, 2)}</td>
             <td class="r neg">${fmt(r.stop, 2)}</td>
-            <td class="muted" style="font-size:10px">${r.entry_ts?.slice(11, 19) ?? ''}</td>
+            <td class="muted" style="font-size:10px">${fmtTimeLocal(r.entry_ts)}</td>
           </tr>`).join('')}</tbody>
         </table>` : '<div class="muted">No open positions.</div>'}
       </div>

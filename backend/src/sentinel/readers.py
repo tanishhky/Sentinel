@@ -225,6 +225,30 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
             ),
         }
 
+    # Per-category breakdown for diagnostic visibility.
+    by_category: dict[str, dict[str, Any]] = {}
+    if "category" in df.columns:
+        for cat in df["category"].fillna("other").unique():
+            c_df = df[df["category"].fillna("other") == cat]
+            c_closed = c_df[c_df["status"] != "open"]
+            by_category[str(cat)] = {
+                "total": len(c_df),
+                "open": int((c_df["status"] == "open").sum()),
+                "closed": len(c_closed),
+                "pnl_usd": (
+                    round(float(c_closed["pnl_usd"].fillna(0).sum()), 2)
+                    if not c_closed.empty else 0.0
+                ),
+                "hit_rate": (
+                    round(float((c_closed["pnl_usd"] > 0).mean()), 3)
+                    if not c_closed.empty else None
+                ),
+                "avg_pnl": (
+                    round(float(c_closed["pnl_usd"].fillna(0).mean()), 2)
+                    if not c_closed.empty else None
+                ),
+            }
+
     summary = {
         "total_trades": len(df),
         "open_count": len(open_df),
@@ -249,6 +273,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
         ),
         "by_venue": by_venue,
         "by_trader": by_trader,
+        "by_category": by_category,
     }
 
     def _row(r) -> dict:
@@ -256,6 +281,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
             "trade_id": r.get("trade_id"),
             "trader": r.get("trader") or "—",
             "venue": r.get("venue") or "—",
+            "category": r.get("category") or "—",
             "question": r.get("question"),
             "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
             "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
