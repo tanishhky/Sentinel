@@ -13,6 +13,7 @@ const TOP_TABS = [
 
 const SUB_TABS = {
   pinsight: [
+    { id: "paper", label: "PAPER", render: renderPSPaper },
     { id: "chain", label: "CHAIN", render: renderPSChain },
     { id: "flags", label: "FLAGS", render: renderPSFlags },
     { id: "logs",  label: "LOGS",  render: () => renderLogs("pinsight") },
@@ -30,7 +31,7 @@ const SUB_TABS = {
 };
 
 let activeTop = "dashboard";
-let activeSub = { pinsight: "chain", driftedge: "paper", sentinel: "health" };
+let activeSub = { pinsight: "paper", driftedge: "paper", sentinel: "health" };
 let refreshTimer = null;
 let chartRegistry = {};
 
@@ -361,6 +362,132 @@ function drawEquityChart(canvasId, eq) {
       },
     },
   });
+}
+
+async function renderPSPaper() {
+  try {
+    const [d, eq] = await Promise.all([
+      jget("/api/pinsight/paper"),
+      jget("/api/pinsight/paper/equity-history"),
+    ]);
+    if (d.status !== "ok") {
+      set(`<div class="muted">No paper trades yet. The poll daemon runs the
+        edge_buyer agent every 90 s during US market hours; come back when
+        the market is open.</div>`);
+      return;
+    }
+    const s = d.summary;
+    const tr = (s.by_trader && s.by_trader.edge_buyer) || {};
+    const retPct = tr.bankroll_init
+      ? ((tr.total_equity || 0) / tr.bankroll_init - 1) * 100 + (tr.closed_pnl || 0) / tr.bankroll_init * 100 - (tr.closed_pnl || 0) / tr.bankroll_init * 100
+      : null;
+    const realisedPct = tr.bankroll_init
+      ? ((tr.closed_pnl || 0) / tr.bankroll_init * 100)
+      : null;
+    const retClass = signClass(realisedPct);
+
+    set(`
+      <div class="grid grid-4" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title" style="color:#88ff66">EDGE_BUYER</div>
+          <div class="muted mono" style="font-size:10px;margin-bottom:6px">Buy SPY 0DTE contracts where market_mid &lt; 0.85 × fair</div>
+          <div class="kpi-value mono ${retClass}">${realisedPct != null ? signFmt(realisedPct, 3) + "%" : "—"}</div>
+          <div class="muted mono" style="font-size:10px;margin-top:4px">Realised return on $${fmtInt(tr.bankroll_init || 0)}</div>
+        </div>
+        ${kpi("Equity", "$" + fmt(tr.total_equity ?? 0, 2), `cash $${fmt(tr.cash_usd ?? 0, 2)} · open $${fmt(tr.open_exposure ?? 0, 2)}`)}
+        ${kpi("Closed P&L", `<span class="${signClass(tr.closed_pnl)}">$${signFmt(tr.closed_pnl ?? 0, 2)}</span>`,
+              `${s.wins ?? 0}W / ${s.losses ?? 0}L · hit ${s.hit_rate != null ? (s.hit_rate * 100).toFixed(1) + "%" : "—"}`)}
+        ${kpi("Positions", `${s.open_count ?? 0} open`, `${s.closed_count ?? 0} closed lifetime`)}
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">EQUITY CURVE · $${fmtInt(tr.bankroll_init || 50000)} BANKROLL · COST-BASIS
+          <span class="muted" style="font-weight:normal;font-size:10px">(MTM extension TODO)</span></div>
+        ${eq.status === "ok"
+          ? '<div class="chart-wrap tall"><canvas id="psPaperEquityChart"></canvas></div>'
+          : '<div class="muted">No equity history yet.</div>'}
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">OPEN POSITIONS (${d.open.length})</div>
+        ${d.open.length ? `<table>
+          <thead><tr>
+            <th>Ticker</th><th>Kind</th><th class="r">Strike</th>
+            <th class="r">Entry</th><th class="r">Fair</th><th class="r">Edge</th>
+            <th class="r">P(ITM)</th><th class="r">N</th><th class="r">Size</th>
+            <th>Opened</th>
+          </tr></thead>
+          <tbody>${d.open.map(r => `<tr>
+            <td class="muted" style="font-size:10px">${r.ticker ?? '—'}</td>
+            <td class="${r.kind === 'put' ? 'neg' : 'pos'}">${(r.kind || '').toUpperCase()}</td>
+            <td class="r amber">${fmt(r.strike, 0)}</td>
+            <td class="r">${fmt(r.entry_price, 3)}</td>
+            <td class="r muted">${fmt(r.fair_at_entry, 3)}</td>
+            <td class="r amber">${fmt(r.edge_at_entry, 3)}</td>
+            <td class="r">${(r.prob_itm_at_entry * 100).toFixed(0)}%</td>
+            <td class="r">${r.n_contracts}</td>
+            <td class="r">$${fmt(r.size_usd, 2)}</td>
+            <td class="muted" style="font-size:10px">${fmtTsLocal(r.entry_ts)}</td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<div class="muted">No open positions.</div>'}
+      </div>
+
+      <div class="card">
+        <div class="card-title">CLOSED POSITIONS (${d.closed.length})</div>
+        ${d.closed.length ? `<table>
+          <thead><tr>
+            <th>Ticker</th><th>K</th><th>Kind</th>
+            <th class="r">Entry</th><th class="r">Exit</th>
+            <th class="r">Spot in/out</th><th class="r">N</th>
+            <th>Reason</th><th class="r">P&L</th>
+          </tr></thead>
+          <tbody>${d.closed.map(r => {
+            const cls = signClass(r.pnl_usd);
+            return `<tr>
+              <td class="muted" style="font-size:10px">${r.ticker ?? '—'}</td>
+              <td class="r amber">${fmt(r.strike, 0)}</td>
+              <td class="${r.kind === 'put' ? 'neg' : 'pos'}">${(r.kind || '').toUpperCase()}</td>
+              <td class="r">${fmt(r.entry_price, 3)}</td>
+              <td class="r">${fmt(r.exit_price, 3)}</td>
+              <td class="r muted" style="font-size:10px">${fmt(r.spot_at_entry, 2)} → ${fmt(r.spot_at_exit, 2)}</td>
+              <td class="r">${r.n_contracts}</td>
+              <td class="amber">${r.exit_reason ?? ''}</td>
+              <td class="r ${cls}">$${signFmt(r.pnl_usd, 2)}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>` : '<div class="muted">No closed positions yet.</div>'}
+      </div>`);
+
+    if (eq.status === "ok") {
+      const ctx = document.getElementById("psPaperEquityChart");
+      if (ctx) {
+        mkChart("psPaperEquityChart", {
+          type: "line",
+          data: {
+            datasets: Object.entries(eq.series).map(([trader, pts]) => ({
+              label: trader.toUpperCase(),
+              data: pts.map(p => ({ x: p.ts, y: p.equity })),
+              borderColor: "#88ff66",
+              backgroundColor: "#88ff6633",
+              borderWidth: 2, pointRadius: 0, pointHoverRadius: 4,
+              stepped: "before", tension: 0,
+            })),
+          },
+          options: {
+            ...CHART_BASE,
+            scales: {
+              x: CHART_TIME_OPTS,
+              y: { ...CHART_BASE.scales.y,
+                   ticks: { ...CHART_BASE.scales.y.ticks,
+                            callback: v => "$" + v.toLocaleString() }},
+            },
+          },
+        });
+      }
+    }
+  } catch (e) {
+    set(`<div class="neg">Error: ${e.message}</div>`);
+  }
 }
 
 async function renderPSChain() {

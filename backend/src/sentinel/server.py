@@ -83,6 +83,14 @@ def create_app() -> FastAPI:
         return readers.pinsight_chain_full(c.pinsight_data,
                                             top_contracts=top_contracts)
 
+    @app.get("/api/pinsight/paper")
+    def pinsight_paper():
+        return readers.pinsight_paper(c.pinsight_data)
+
+    @app.get("/api/pinsight/paper/equity-history")
+    def pinsight_paper_equity():
+        return readers.pinsight_paper_equity_history(c.pinsight_data)
+
     @app.get("/api/pinsight/flags")
     def pinsight_flags(top: int = 20):
         return readers.pinsight_flagged_contracts(c.pinsight_data, top=top)

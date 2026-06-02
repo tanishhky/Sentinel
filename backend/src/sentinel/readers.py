@@ -68,6 +68,106 @@ def pinsight_latest_chain(data_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def pinsight_paper(data_dir: Path) -> dict[str, Any]:
+    """PinSight paper trader state + positions (same shape as DriftEdge)."""
+    trades_path = data_dir / "paper_trades.parquet"
+    state_path = data_dir / "paper_state.parquet"
+    if not trades_path.exists():
+        return {"status": "no_data"}
+    try:
+        df = pd.read_parquet(trades_path)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty:
+        return {"status": "no_data"}
+
+    state: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            st = pd.read_parquet(state_path)
+            for _, r in st.iterrows():
+                state[str(r["trader"])] = {
+                    "bankroll_init": float(r["bankroll_init"]),
+                    "cash_usd": round(float(r["cash_usd"]), 2),
+                    "open_exposure": round(float(r["open_exposure"]), 2),
+                    "closed_pnl": round(float(r["closed_pnl"]), 2),
+                    "peak_equity": round(float(r["peak_equity"]), 2),
+                    "drawdown_pct": round(float(r["current_drawdown_pct"]), 3),
+                    "total_equity": round(float(r["cash_usd"]) + float(r["open_exposure"]), 2),
+                }
+        except Exception:
+            pass
+
+    open_df = df[df["status"] == "open"]
+    closed_df = df[df["status"] != "open"]
+
+    def _row(r) -> dict:
+        return {
+            "trade_id": r.get("trade_id"),
+            "kind": r.get("kind"),
+            "strike": float(r["strike"]) if pd.notna(r.get("strike")) else None,
+            "ticker": r.get("ticker"),
+            "expiry": r.get("expiry"),
+            "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
+            "exit_ts": str(r.get("exit_ts")) if pd.notna(r.get("exit_ts")) else None,
+            "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
+            "exit_price": round(float(r["exit_price"]), 4) if pd.notna(r.get("exit_price")) else None,
+            "n_contracts": int(r["n_contracts"]) if pd.notna(r.get("n_contracts")) else None,
+            "size_usd": round(float(r["entry_size_usd"]), 2) if pd.notna(r.get("entry_size_usd")) else None,
+            "spot_at_entry": round(float(r["spot_at_entry"]), 2) if pd.notna(r.get("spot_at_entry")) else None,
+            "spot_at_exit": round(float(r["spot_at_exit"]), 2) if pd.notna(r.get("spot_at_exit")) else None,
+            "fair_at_entry": round(float(r["fair_at_entry"]), 4) if pd.notna(r.get("fair_at_entry")) else None,
+            "edge_at_entry": round(float(r["edge_at_entry"]), 3) if pd.notna(r.get("edge_at_entry")) else None,
+            "prob_itm_at_entry": round(float(r["prob_itm_at_entry"]), 3) if pd.notna(r.get("prob_itm_at_entry")) else None,
+            "expected_pnl_at_entry": round(float(r["expected_pnl_at_entry"]), 3) if pd.notna(r.get("expected_pnl_at_entry")) else None,
+            "status": r.get("status"),
+            "exit_reason": r.get("exit_reason"),
+            "pnl_usd": round(float(r["pnl_usd"]), 2) if pd.notna(r.get("pnl_usd")) else None,
+        }
+
+    summary = {
+        "total_trades": len(df),
+        "open_count": len(open_df),
+        "closed_count": len(closed_df),
+        "wins": int((closed_df["pnl_usd"] > 0).sum()) if not closed_df.empty else 0,
+        "losses": int((closed_df["pnl_usd"] <= 0).sum()) if not closed_df.empty else 0,
+        "hit_rate": (round(float((closed_df["pnl_usd"] > 0).mean()), 3)
+                      if not closed_df.empty else None),
+        "total_pnl_usd": (round(float(closed_df["pnl_usd"].fillna(0).sum()), 2)
+                          if not closed_df.empty else 0.0),
+        "by_trader": state,
+    }
+    return {
+        "status": "ok",
+        "summary": summary,
+        "open": [_row(r) for _, r in open_df.iterrows()],
+        "closed": [_row(r) for _, r in closed_df.sort_values(
+            "exit_ts", ascending=False).iterrows()],
+    }
+
+
+def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
+    eq_path = data_dir / "equity_history.parquet"
+    if not eq_path.exists():
+        return {"status": "no_data"}
+    try:
+        df = pd.read_parquet(eq_path)
+    except Exception as exc:
+        return {"status": "error", "err": str(exc)}
+    if df.empty:
+        return {"status": "no_data"}
+    series: dict[str, list[dict]] = {}
+    for trader, grp in df.groupby("trader"):
+        grp = grp.sort_values("ts")
+        series[str(trader)] = [
+            {"ts": str(r["ts"]),
+             "equity": round(float(r["total_equity_usd"]), 2),
+             "drawdown_pct": round(float(r["drawdown_pct"]), 3)}
+            for _, r in grp.iterrows()
+        ]
+    return {"status": "ok", "series": series}
+
+
 def pinsight_chain_full(data_dir: Path, top_contracts: int = 30) -> dict[str, Any]:
     """Latest chain with IV-smile series, vol-by-strike aggregates, and a
     top-volume contract list. Drives the CHAIN sub-tab's charts and table.
