@@ -38,13 +38,17 @@ const TRADER_COLORS = {
   kelly: "#ff9000",
   equal: "#00d4ff",
   volwt: "#ff66cc",
+  volharvest: "#88ff66",   // lime — distinct from the three legacy traders
 };
-const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT" };
+const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT",
+                        volharvest: "VOL-HARVEST" };
 const TRADER_DESC = {
   kelly: "Quarter-Kelly · p=0.45",
   equal: "Fixed 2% per trade",
   volwt: "Inverse-σ weighted",
+  volharvest: "Underdog YES + synthetic-NO hedge",
 };
+const ALL_TRADERS = ["kelly", "equal", "volwt", "volharvest"];
 
 function init() {
   const topTabsEl = document.getElementById("top-tabs");
@@ -234,12 +238,12 @@ async function renderDashboard() {
       </div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">3-TRADER EQUITY CURVE · $10,000 BANKROLL EACH</div>
+        <div class="card-title">4-TRADER EQUITY CURVE · $10,000 BANKROLL EACH</div>
         <div class="chart-wrap tall"><canvas id="equityChart"></canvas></div>
       </div>
 
-      <div class="grid grid-3" style="margin-bottom:16px">
-        ${["kelly", "equal", "volwt"].map(id => {
+      <div class="grid grid-4" style="margin-bottom:16px">
+        ${ALL_TRADERS.map(id => {
           const x = t[id] || {};
           const ret = x.return_pct;
           const retClass = signClass(ret);
@@ -329,7 +333,7 @@ function drawHistogramChart(canvasId, dist, color) {
 function drawEquityChart(canvasId, eq) {
   if (eq.status !== "ok") return;
   const datasets = [];
-  for (const trader of ["kelly", "equal", "volwt"]) {
+  for (const trader of ALL_TRADERS) {
     const series = eq.series[trader];
     if (!series || !series.length) continue;
     datasets.push({
@@ -677,21 +681,23 @@ function drawVoiHistChart(canvasId, items) {
 
 async function renderDEPaper() {
   try {
-    const [d, eq, risk, distK, distE, distV] = await Promise.all([
+    const baseFetches = [
       jget("/api/driftedge/paper"),
       jget("/api/driftedge/paper/equity-history"),
       jget("/api/driftedge/paper/risk-stats"),
-      jget("/api/driftedge/paper/pnl-distribution?trader=kelly"),
-      jget("/api/driftedge/paper/pnl-distribution?trader=equal"),
-      jget("/api/driftedge/paper/pnl-distribution?trader=volwt"),
-    ]);
-    const dists = { kelly: distK, equal: distE, volwt: distV };
+    ];
+    const distFetches = ALL_TRADERS.map(t =>
+      jget(`/api/driftedge/paper/pnl-distribution?trader=${t}`));
+    const results = await Promise.all([...baseFetches, ...distFetches]);
+    const [d, eq, risk] = results;
+    const distArr = results.slice(3);
+    const dists = Object.fromEntries(ALL_TRADERS.map((t, i) => [t, distArr[i]]));
     if (d.status !== "ok") {
       set(`<div class="muted">No paper trades yet.</div>`);
       return;
     }
     const s = d.summary;
-    const TRADERS = ["kelly", "equal", "volwt"];
+    const TRADERS = ALL_TRADERS;
 
     const traderCards = TRADERS.map(t => {
       const x = s.by_trader?.[t] || {};
@@ -747,10 +753,10 @@ async function renderDEPaper() {
     }).join("");
 
     set(`
-      <div class="grid grid-3" style="margin-bottom:16px">${traderCards}</div>
+      <div class="grid grid-4" style="margin-bottom:16px">${traderCards}</div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">EQUITY CURVE · 3-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(continuous MTM, updates every tick)</span></div>
+        <div class="card-title">EQUITY CURVE · 4-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(continuous MTM, updates every tick)</span></div>
         <div class="chart-wrap tall"><canvas id="paperEquityChart"></canvas></div>
       </div>
 
@@ -761,8 +767,8 @@ async function renderDEPaper() {
 
       <div class="card" style="margin-bottom:16px">
         <div class="card-title">P&L DISTRIBUTION PER TRADER <span class="muted" style="font-weight:normal;font-size:10px">(realized closed trades — test for normality / fat tails)</span></div>
-        <div class="grid grid-3">
-          ${["kelly", "equal", "volwt"].map(t => `
+        <div class="grid grid-4">
+          ${ALL_TRADERS.map(t => `
             <div>
               <div class="muted mono" style="font-size:10px;margin-bottom:4px;color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
               ${renderDistMeta(dists[t])}
@@ -867,7 +873,7 @@ async function renderDEPaper() {
     });
 
     drawEquityChart("paperEquityChart", eq);
-    for (const t of ["kelly", "equal", "volwt"]) {
+    for (const t of ALL_TRADERS) {
       drawHistogramChart(`distChart_${t}`, dists[t], TRADER_COLORS[t]);
     }
   } catch (e) {
@@ -879,7 +885,7 @@ function renderRiskPanel(risk) {
   if (!risk || risk.status !== "ok") {
     return '<div class="muted">No risk-history yet — needs a few ticks of paper engine activity.</div>';
   }
-  const TRADERS = ["kelly", "equal", "volwt"];
+  const TRADERS = ALL_TRADERS;
   const cells = TRADERS.map(t => {
     const r = risk.by_trader[t] || {};
     const retCls = signClass(r.total_return_pct);
@@ -904,7 +910,7 @@ function renderRiskPanel(risk) {
       </div>
     </div>`;
   }).join("");
-  return `<div class="grid grid-3">${cells}</div>`;
+  return `<div class="grid grid-4">${cells}</div>`;
 }
 
 function renderDistMeta(dist) {
