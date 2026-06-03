@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -41,6 +41,17 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Sentinel", version="0.0.1")
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/manifest.json")
+    def manifest():
+        return FileResponse(_STATIC_DIR / "manifest.json",
+                            media_type="application/manifest+json")
+
+    @app.get("/sw.js")
+    def service_worker():
+        return FileResponse(_STATIC_DIR / "sw.js",
+                            media_type="application/javascript",
+                            headers={"Service-Worker-Allowed": "/"})
 
     @app.get("/", response_class=HTMLResponse)
     def root():
