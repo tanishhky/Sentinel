@@ -20,6 +20,7 @@ const SUB_TABS = {
   ],
   driftedge: [
     { id: "paper",   label: "PAPER",   render: renderDEPaper },
+    { id: "returns", label: "RETURNS", render: renderDEReturns },
     { id: "markets", label: "MARKETS", render: renderDEMarkets },
     { id: "books",   label: "BOOKS",   render: renderDEBooks },
     { id: "news",    label: "NEWS",    render: renderDENews },
@@ -36,20 +37,27 @@ let refreshTimer = null;
 let chartRegistry = {};
 
 const TRADER_COLORS = {
-  kelly: "#ff9000",
-  equal: "#00d4ff",
-  volwt: "#ff66cc",
-  volharvest: "#88ff66",   // lime — distinct from the three legacy traders
+  kelly:      "#ff9000",
+  equal:      "#00d4ff",
+  volwt:      "#ff66cc",
+  volharvest: "#88ff66",
+  resolution: "#ff4466",
 };
-const TRADER_LABELS = { kelly: "KELLY", equal: "EQUAL-WT", volwt: "VOL-WT",
-                        volharvest: "VOL-HARVEST" };
+const TRADER_LABELS = {
+  kelly:      "KELLY",
+  equal:      "EQUAL-WT",
+  volwt:      "VOL-WT",
+  volharvest: "VOL-HARVEST",
+  resolution: "RESOLUTION",
+};
 const TRADER_DESC = {
-  kelly: "Quarter-Kelly · p=0.45",
-  equal: "Fixed 2% per trade",
-  volwt: "Inverse-σ weighted",
+  kelly:      "Quarter-Kelly · p=0.45",
+  equal:      "Fixed 2% per trade",
+  volwt:      "Inverse-σ weighted",
   volharvest: "Underdog YES + synthetic-NO hedge",
+  resolution: "Hold-to-binary · entry [0.25, 0.50] · ≤72 h horizon",
 };
-const ALL_TRADERS = ["kelly", "equal", "volwt", "volharvest"];
+const ALL_TRADERS = ["kelly", "equal", "volwt", "volharvest", "resolution"];
 
 function init() {
   const topTabsEl = document.getElementById("top-tabs");
@@ -243,16 +251,16 @@ async function renderDashboard() {
         <div class="chart-wrap tall"><canvas id="equityChart"></canvas></div>
       </div>
 
-      <div class="grid grid-4" style="margin-bottom:16px">
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px">
         ${ALL_TRADERS.map(id => {
           const x = t[id] || {};
           const ret = x.return_pct;
           const retClass = signClass(ret);
           return `<div class="card">
-            <div class="card-title" style="color:${TRADER_COLORS[id]}">${TRADER_LABELS[id]}</div>
-            <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[id]}</div>
-            <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
-            <div class="muted mono" style="font-size:10px">Return · Equity $${fmt(x.total_equity ?? 0, 2)}</div>
+            <div class="card-title" style="color:${TRADER_COLORS[id]};font-size:10px">${TRADER_LABELS[id]}</div>
+            <div class="muted mono" style="font-size:9px;margin-bottom:6px">${TRADER_DESC[id]}</div>
+            <div class="kpi-value mono ${retClass}" style="font-size:16px">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
+            <div class="muted mono" style="font-size:10px">$${fmt(x.total_equity ?? 0, 2)}</div>
           </div>`;
         }).join("")}
       </div>
@@ -331,7 +339,9 @@ function drawHistogramChart(canvasId, dist, color) {
   });
 }
 
-function drawEquityChart(canvasId, eq) {
+// Portfolio Value — smooth continuous MTM (cash + current market value of open positions).
+// Moves every tick as book mids shift. Shows live performance.
+function drawPortfolioChart(canvasId, eq) {
   if (eq.status !== "ok") return;
   const datasets = [];
   for (const trader of ALL_TRADERS) {
@@ -341,8 +351,44 @@ function drawEquityChart(canvasId, eq) {
       label: TRADER_LABELS[trader],
       data: series.map(p => ({ x: p.ts, y: p.equity })),
       borderColor: TRADER_COLORS[trader],
-      backgroundColor: TRADER_COLORS[trader] + "33",
+      backgroundColor: TRADER_COLORS[trader] + "22",
       borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      tension: 0.3,
+      fill: false,
+    });
+  }
+  mkChart(canvasId, {
+    type: "line",
+    data: { datasets },
+    options: {
+      ...CHART_BASE,
+      scales: {
+        x: CHART_TIME_OPTS,
+        y: { ...CHART_BASE.scales.y,
+             ticks: { ...CHART_BASE.scales.y.ticks,
+                      callback: v => "$" + v.toLocaleString() }},
+      },
+    },
+  });
+}
+
+// Equity curve — available cash in hand. Drops when a position is opened
+// (capital deployed), recovers on close (cash returned ± P&L). Stepped
+// because cash only changes on transaction events, not market prices.
+function drawEquityChart(canvasId, eq) {
+  if (eq.status !== "ok") return;
+  const datasets = [];
+  for (const trader of ALL_TRADERS) {
+    const series = eq.series[trader];
+    if (!series || !series.length) continue;
+    datasets.push({
+      label: TRADER_LABELS[trader],
+      data: series.map(p => ({ x: p.ts, y: p.cash ?? (p.equity - (p.mtm || 0)) })),
+      borderColor: TRADER_COLORS[trader],
+      backgroundColor: TRADER_COLORS[trader] + "33",
+      borderWidth: 1.5,
       pointRadius: 0,
       pointHoverRadius: 4,
       stepped: "before",
@@ -362,6 +408,211 @@ function drawEquityChart(canvasId, eq) {
       },
     },
   });
+}
+
+// ──────────────── INVESTMENT RETURNS ────────────────
+// Three modes:
+//   abs          — $ absolute P&L (closed + MTM unrealized)
+//   pct_bankroll — P&L as % of starting bankroll ($10 k)
+//   pct_deployed — P&L as % of capital currently in positions (open_exposure)
+//                  shows "efficiency" of deployed capital; meaningful when >0
+
+let returnsMode = "abs";
+
+// Floating tooltip for (ⓘ) icons — shared across the whole page.
+let _tipEl = null;
+function showTip(anchor, text) {
+  hideTip();
+  _tipEl = document.createElement("div");
+  _tipEl.style.cssText = `
+    position:fixed; z-index:9999; max-width:280px;
+    background:#1a1a1a; border:1px solid #333; color:#ccc;
+    font-family:var(--mono); font-size:11px; line-height:1.5;
+    padding:8px 10px; border-radius:3px;
+    pointer-events:none; white-space:pre-line;
+  `;
+  _tipEl.textContent = text;
+  document.body.appendChild(_tipEl);
+  const r = anchor.getBoundingClientRect();
+  _tipEl.style.top = (r.bottom + 6) + "px";
+  _tipEl.style.left = Math.min(r.left, window.innerWidth - 300) + "px";
+}
+function hideTip() { if (_tipEl) { _tipEl.remove(); _tipEl = null; } }
+
+const RETURN_MODE_TIPS = {
+  abs:         `$ P&L — total equity minus starting $10k.\nIncludes both realized P&L and unrealized MTM.\n\nFormula: equity(t) − 10,000`,
+  pct_bankroll:`% Bankroll — P&L as % of starting $10k.\nFair apples-to-apples comparison since\nevery agent starts with the same bankroll.\n\nFormula: (equity(t) − 10,000) / 10,000 × 100`,
+  pct_closed:  `Closed / Closed — return on capital\ncommitted to RESOLVED positions only.\n\nNumerator:   cumulative realized P&L (closed trades)\nDenominator: cumulative capital deployed in those\n             same closed trades\n\nExample: earn $2k on $4k, then earn $1k on $6k\n→ return = (2k + 1k) / (4k + 6k) = 30%\n\nOpen positions don't touch either number.\nOnly appears after the first trade closes.`,
+  pct_open:    `Open / Open — return on capital\ncurrently AT RISK in open positions.\n\nNumerator:   unrealized MTM P&L on open positions\nDenominator: current open exposure (entry cost)\n\nMoves every tick as book mids shift.\nShows how your live book is performing\nrelative to what you actually have deployed.\nNull when no positions are open.`,
+};
+
+function _infoIcon(mode) {
+  return `<span
+    style="cursor:help;color:#555;font-size:12px;margin-left:3px;vertical-align:middle;user-select:none"
+    onmouseenter="showTip(this,RETURN_MODE_TIPS['${mode}'])"
+    onmouseleave="hideTip()"
+  >ⓘ</span>`;
+}
+
+function drawReturnsChart(canvasId, eq, mode) {
+  if (eq.status !== "ok") return;
+  const bankrolls = eq.bankrolls || {};
+  const datasets = [];
+  for (const trader of ALL_TRADERS) {
+    const series = eq.series[trader];
+    if (!series || !series.length) continue;
+    const bankroll = bankrolls[trader] || 10000;
+    const points = [];
+    for (const p of series) {
+      let y;
+      if (mode === "abs") {
+        y = p.equity - bankroll;
+      } else if (mode === "pct_bankroll") {
+        y = ((p.equity - bankroll) / bankroll) * 100;
+      } else if (mode === "pct_closed") {
+        // closed P&L / cumulative capital deployed in closed trades
+        const dep = p.cum_deployed_usd ?? 0;
+        y = dep > 0 ? ((p.closed_pnl ?? 0) / dep) * 100 : null;
+      } else {
+        // pct_open: unrealized MTM / current open exposure
+        const exp = p.exposure ?? 0;
+        y = exp > 0 ? ((p.mtm ?? 0) / exp) * 100 : null;
+      }
+      if (y !== null && y !== undefined) {
+        points.push({ x: p.ts, y: round2(y) });
+      }
+    }
+    if (!points.length) continue;
+    datasets.push({
+      label: TRADER_LABELS[trader],
+      data: points,
+      borderColor: TRADER_COLORS[trader],
+      backgroundColor: TRADER_COLORS[trader] + "22",
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      spanGaps: true,
+      stepped: mode === "pct_closed" ? "before" : false,
+      tension: (mode === "abs" || mode === "pct_open") ? 0.2 : 0,
+      fill: false,
+    });
+  }
+  const yFmt = mode === "abs"
+    ? v => (v >= 0 ? "+" : "") + "$" + Math.abs(v).toLocaleString(undefined, {maximumFractionDigits: 0})
+    : v => (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+  mkChart(canvasId, {
+    type: "line",
+    data: { datasets },
+    options: {
+      ...CHART_BASE,
+      scales: {
+        x: CHART_TIME_OPTS,
+        y: {
+          ...CHART_BASE.scales.y,
+          ticks: { ...CHART_BASE.scales.y.ticks, callback: yFmt },
+          grid: { color: "#1a1a1a" },
+        },
+      },
+    },
+  });
+}
+
+function round2(n) { return Math.round(n * 100) / 100; }
+
+async function renderDEReturns() {
+  try {
+    const [eq, risk] = await Promise.all([
+      jget("/api/driftedge/paper/equity-history"),
+      jget("/api/driftedge/paper/risk-stats"),
+    ]);
+
+    const bankrolls = eq.bankrolls || {};
+    const modeDefs = [
+      { id: "abs",          label: "$ P&L" },
+      { id: "pct_bankroll", label: "% Bankroll" },
+      { id: "pct_closed",   label: "Closed/Closed" },
+      { id: "pct_open",     label: "Open/Open" },
+    ];
+
+    const summaryRows = ALL_TRADERS.map(t => {
+      const r = (risk.by_trader || {})[t] || {};
+      const series = (eq.series || {})[t] || [];
+      const bankroll = bankrolls[t] || 10000;
+      const lastPt = series[series.length - 1];
+      const totalPnl   = lastPt ? lastPt.equity - bankroll : 0;
+      const closedPnl  = lastPt ? (lastPt.closed_pnl ?? 0) : 0;
+      const cumDeployed = lastPt ? (lastPt.cum_deployed_usd ?? 0) : 0;
+      const mtm        = lastPt ? (lastPt.mtm ?? 0) : 0;
+      const exposure   = lastPt ? (lastPt.exposure ?? 0) : 0;
+      const pctBank    = bankroll ? (totalPnl / bankroll * 100) : null;
+      const pctClosed  = cumDeployed > 0 ? (closedPnl / cumDeployed * 100) : null;
+      const pctOpen    = exposure > 0 ? (mtm / exposure * 100) : null;
+      const pnlCls     = signClass(totalPnl);
+      const closedCls  = signClass(closedPnl);
+      const openCls    = signClass(mtm);
+      return `<tr>
+        <td style="color:${TRADER_COLORS[t]};font-weight:bold">${TRADER_LABELS[t]}</td>
+        <td class="r ${pnlCls}">$${signFmt(totalPnl, 2)}</td>
+        <td class="r ${pnlCls}">${pctBank != null ? signFmt(pctBank, 3) + "%" : "—"}</td>
+        <td class="r ${closedCls}">${pctClosed != null ? signFmt(pctClosed, 2) + "%" : "<span class='muted'>—</span>"}</td>
+        <td class="r muted" style="font-size:10px">$${fmt(cumDeployed, 0)}</td>
+        <td class="r ${openCls}">${pctOpen != null ? signFmt(pctOpen, 2) + "%" : "<span class='muted'>—</span>"}</td>
+        <td class="r muted" style="font-size:10px">$${fmt(exposure, 0)}</td>
+        <td class="r">${r.closed_trades ?? 0}</td>
+        <td class="r">${r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + "%" : "—"}</td>
+        <td class="r">${r.sharpe != null ? fmt(r.sharpe, 2) : "—"}</td>
+      </tr>`;
+    }).join("");
+
+    set(`
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title" style="display:flex;align-items:center;gap:12px">
+          INVESTMENT RETURNS · BASELINE 0
+          <span style="font-weight:normal;font-size:10px;color:var(--muted)">baseline = $10,000 per trader</span>
+          <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+            ${modeDefs.map(({ id, label }) =>
+              `<span style="display:inline-flex;align-items:center;gap:0">
+                <button onclick="returnsMode='${id}';renderDEReturns()"
+                  style="background:${returnsMode===id?'var(--primary)':'transparent'};
+                         border:1px solid ${returnsMode===id?'var(--primary)':'var(--border)'};
+                         color:${returnsMode===id?'#000':'var(--text)'};
+                         padding:2px 10px;cursor:pointer;
+                         font-family:var(--mono);font-size:10px;letter-spacing:0.04em">
+                  ${label}
+                </button>${_infoIcon(id)}
+              </span>`
+            ).join("")}
+          </div>
+        </div>
+        ${eq.status === "ok"
+          ? '<div class="chart-wrap tall"><canvas id="returnsChart"></canvas></div>'
+          : '<div class="muted">No equity history yet.</div>'}
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">PERFORMANCE COMPARISON</div>
+        <table>
+          <thead><tr>
+            <th>Trader</th>
+            <th class="r">$ P&L${_infoIcon("abs")}</th>
+            <th class="r">% Bankroll${_infoIcon("pct_bankroll")}</th>
+            <th class="r">Closed/Closed${_infoIcon("pct_closed")}</th>
+            <th class="r muted" style="font-size:10px">Cum. Deployed</th>
+            <th class="r">Open/Open${_infoIcon("pct_open")}</th>
+            <th class="r muted" style="font-size:10px">Open Exp.</th>
+            <th class="r">Closed</th>
+            <th class="r">Hit Rate</th>
+            <th class="r">Sharpe</th>
+          </tr></thead>
+          <tbody>${summaryRows || '<tr><td colspan="10" class="muted">No data yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    `);
+
+    if (eq.status === "ok") drawReturnsChart("returnsChart", eq, returnsMode);
+  } catch (e) {
+    set(`<div class="neg">Error: ${e.message}</div>`);
+  }
 }
 
 async function renderPSPaper() {
@@ -880,24 +1131,36 @@ async function renderDEPaper() {
     }).join("");
 
     set(`
-      <div class="grid grid-4" style="margin-bottom:16px">${traderCards}</div>
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px">${traderCards}</div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">EQUITY CURVE · 4-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(continuous MTM, updates every tick)</span></div>
-        <div class="chart-wrap tall"><canvas id="paperEquityChart"></canvas></div>
+        <div class="card-title">PORTFOLIO VALUE · 4-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(cash + MTM market value of open positions — updates every tick)</span></div>
+        <div class="chart-wrap tall"><canvas id="paperPortfolioChart"></canvas></div>
       </div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">RISK STATS · MTM-DERIVED</div>
+        <div class="card-title">AVAILABLE CASH <span class="muted" style="font-weight:normal;font-size:10px">(liquid cash in hand — drops when position opens, recovers ± P&L on close)</span></div>
+        <div class="chart-wrap"><canvas id="paperEquityChart"></canvas></div>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <div class="muted mono" style="font-size:10px;margin-bottom:8px;letter-spacing:0.06em">
+          RISK STATS · MTM-DERIVED
+        </div>
         ${renderRiskPanel(risk)}
       </div>
 
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-title">P&L DISTRIBUTION PER TRADER <span class="muted" style="font-weight:normal;font-size:10px">(realized closed trades — test for normality / fat tails)</span></div>
-        <div class="grid grid-4">
+      <div style="margin-bottom:16px">
+        <div class="muted mono" style="font-size:10px;margin-bottom:8px;letter-spacing:0.06em">
+          P&amp;L DISTRIBUTION PER TRADER <span style="color:#444">(realized closed trades — normality / fat tails)</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px">
           ${ALL_TRADERS.map(t => `
-            <div>
-              <div class="muted mono" style="font-size:10px;margin-bottom:4px;color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
+            <div class="card" style="border-top:2px solid ${TRADER_COLORS[t]};padding:12px">
+              <div style="color:${TRADER_COLORS[t]};font-family:var(--mono);font-size:11px;
+                          font-weight:bold;letter-spacing:0.06em;margin-bottom:6px">
+                ${TRADER_LABELS[t]}
+              </div>
               ${renderDistMeta(dists[t])}
               <div class="chart-wrap"><canvas id="distChart_${t}"></canvas></div>
             </div>`).join("")}
@@ -953,13 +1216,16 @@ async function renderDEPaper() {
         <div class="card">
           <div class="card-title">CONFIG</div>
           <div style="font-family:var(--mono);font-size:11px;line-height:1.7">
-            <div><span class="muted">Bankroll / trader:</span> <span class="amber">$10,000</span></div>
+            <div><span class="muted">Bankroll / trader:</span> <span class="amber">$10,000 × 5</span></div>
             <div><span class="muted">Per-position cap:</span> <span>2% = $200</span></div>
             <div><span class="muted">Aggregate cap:</span> <span>50% = $5,000</span></div>
             <div><span class="muted">Min trade:</span> <span>$5</span></div>
-            <div><span class="muted">Entry zone:</span> <span>[0.30, 0.40] <span class="muted">(hardcoded)</span></span></div>
+            <div><span class="muted">Kelly/Equal/VolWt entry:</span> <span>[0.30, 0.40]</span></div>
+            <div><span class="muted">VolHarvest entry:</span> <span>[0.10, 0.30] underdog YES</span></div>
+            <div><span class="muted">Resolution entry:</span> <span>[0.25, 0.50] · ≤72 h horizon</span></div>
             <div><span class="muted">Target / Stop:</span> <span class="pos">0.60</span> / <span class="neg">0.20</span></div>
-            <div><span class="muted">Force-exit:</span> <span>6h before resolution</span></div>
+            <div><span class="muted">Force-exit (std):</span> <span>6h before resolution</span></div>
+            <div><span class="muted">Force-exit (res):</span> <span>1h before resolution</span></div>
           </div>
         </div>
       </div>
@@ -999,6 +1265,7 @@ async function renderDEPaper() {
       });
     });
 
+    drawPortfolioChart("paperPortfolioChart", eq);
     drawEquityChart("paperEquityChart", eq);
     for (const t of ALL_TRADERS) {
       drawHistogramChart(`distChart_${t}`, dists[t], TRADER_COLORS[t]);
@@ -1012,32 +1279,36 @@ function renderRiskPanel(risk) {
   if (!risk || risk.status !== "ok") {
     return '<div class="muted">No risk-history yet — needs a few ticks of paper engine activity.</div>';
   }
-  const TRADERS = ALL_TRADERS;
-  const cells = TRADERS.map(t => {
-    const r = risk.by_trader[t] || {};
-    const retCls = signClass(r.total_return_pct);
-    const ddCls = (r.max_drawdown_pct ?? 0) > 5 ? "neg" : "muted";
-    const sharpe = r.sharpe;
-    const sharpeCls = sharpe == null ? "muted" : (sharpe > 0 ? "pos" : "neg");
-    return `<div>
-      <div class="muted mono" style="font-size:10px;color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 12px;font-family:var(--mono);font-size:11px;margin-top:6px">
-        <div><span class="muted">Return:</span> <span class="${retCls}">${r.total_return_pct != null ? signFmt(r.total_return_pct, 3) + "%" : "—"}</span></div>
-        <div><span class="muted">Equity:</span> <span>$${fmt(r.current_equity ?? 0, 2)}</span></div>
-        <div><span class="muted">Max DD:</span> <span class="${ddCls}">-${fmt(r.max_drawdown_pct ?? 0, 2)}%</span></div>
-        <div><span class="muted">Cur DD:</span> <span>-${fmt(r.current_drawdown_pct ?? 0, 2)}%</span></div>
-        <div><span class="muted">Sharpe:</span> <span class="${sharpeCls}">${sharpe != null ? fmt(sharpe, 2) : "—"}</span></div>
-        <div><span class="muted">Sortino:</span> <span>${r.sortino != null ? fmt(r.sortino, 2) : "—"}</span></div>
-        <div><span class="muted">Hit rate:</span> <span>${r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
-        <div><span class="muted">PF:</span> <span>${r.profit_factor != null ? fmt(r.profit_factor, 2) : "—"}</span></div>
-        <div><span class="muted">Avg win:</span> <span class="pos">$${fmt(r.avg_win_usd ?? 0, 2)}</span></div>
-        <div><span class="muted">Avg loss:</span> <span class="neg">$${fmt(r.avg_loss_usd ?? 0, 2)}</span></div>
-        <div><span class="muted">Snaps:</span> <span>${r.snapshots ?? 0}</span></div>
-        <div><span class="muted">Closed:</span> <span>${r.closed_trades ?? 0}</span></div>
-      </div>
-    </div>`;
-  }).join("");
-  return `<div class="grid grid-4">${cells}</div>`;
+  return `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px">
+    ${ALL_TRADERS.map(t => {
+      const r = risk.by_trader[t] || {};
+      const retCls = signClass(r.total_return_pct);
+      const ddCls = (r.max_drawdown_pct ?? 0) > 5 ? "neg" : "muted";
+      const sharpe = r.sharpe;
+      const sharpeCls = sharpe == null ? "muted" : (sharpe > 0 ? "pos" : "neg");
+      return `<div class="card" style="border-top:2px solid ${TRADER_COLORS[t]};padding:12px">
+        <div style="color:${TRADER_COLORS[t]};font-family:var(--mono);font-size:11px;
+                    font-weight:bold;letter-spacing:0.06em;margin-bottom:8px">
+          ${TRADER_LABELS[t]}
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;
+                    font-family:var(--mono);font-size:11px">
+          <div><span class="muted">Return:</span> <span class="${retCls}">${r.total_return_pct != null ? signFmt(r.total_return_pct, 3) + "%" : "—"}</span></div>
+          <div><span class="muted">Equity:</span> <span>$${fmt(r.current_equity ?? 0, 2)}</span></div>
+          <div><span class="muted">Max DD:</span> <span class="${ddCls}">-${fmt(r.max_drawdown_pct ?? 0, 2)}%</span></div>
+          <div><span class="muted">Cur DD:</span> <span>-${fmt(r.current_drawdown_pct ?? 0, 2)}%</span></div>
+          <div><span class="muted">Sharpe:</span> <span class="${sharpeCls}">${sharpe != null ? fmt(sharpe, 2) : "—"}</span></div>
+          <div><span class="muted">Sortino:</span> <span>${r.sortino != null ? fmt(r.sortino, 2) : "—"}</span></div>
+          <div><span class="muted">Hit rate:</span> <span>${r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + "%" : "—"}</span></div>
+          <div><span class="muted">PF:</span> <span>${r.profit_factor != null ? fmt(r.profit_factor, 2) : "—"}</span></div>
+          <div><span class="muted">Avg win:</span> <span class="pos">$${fmt(r.avg_win_usd ?? 0, 2)}</span></div>
+          <div><span class="muted">Avg loss:</span> <span class="neg">$${fmt(r.avg_loss_usd ?? 0, 2)}</span></div>
+          <div><span class="muted">Snaps:</span> <span>${r.snapshots ?? 0}</span></div>
+          <div><span class="muted">Closed:</span> <span>${r.closed_trades ?? 0}</span></div>
+        </div>
+      </div>`;
+    }).join("")}
+  </div>`;
 }
 
 function renderDistMeta(dist) {
@@ -1206,15 +1477,33 @@ async function renderSEHealth() {
 
     const log = await jget("/api/logs/driftedge?max_lines=50");
     const events = (log.events ?? []).reverse();
-    const html = events.map(e => `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
-      <span class="log-ts">${fmtTimeLocal(e.ts)}</span>
-      <span class="log-channel">${e.channel}</span>
-      <span class="log-kind">${e.kind}</span>
-    </div>`).join("");
+    const html = events.map(_fmtLogRow).join("");
     document.getElementById("recentLogs").innerHTML = html || '<span class="muted">No events.</span>';
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }
+}
+
+function _fmtLogRow(e) {
+  const lvl = (e.level ?? "info").toLowerCase();
+  const lvlColor = lvl === "error" ? "#ff4444" : lvl === "warning" ? "#ff9000" : "#666666";
+  const kindColor = lvl === "error" ? "#ff4444" : lvl === "warning" ? "#ff9000" : "#ffffff";
+  const fields = Object.entries(e)
+    .filter(([k]) => !["ts", "channel", "kind", "level", "run_id"].includes(k))
+    .map(([k, v]) => `<span style="color:#666">${k}=</span><span style="color:#aaa">${
+      typeof v === 'object' ? JSON.stringify(v) : String(v)
+    }</span>`)
+    .join("  ");
+  return `<div style="display:grid;grid-template-columns:70px 50px 90px 200px 1fr;
+                      align-items:center;padding:2px 0;
+                      border-bottom:1px solid #111;
+                      font-family:var(--mono);font-size:11px;line-height:1.4">
+    <span style="color:#444">${fmtTimeLocal(e.ts)}</span>
+    <span style="color:${lvlColor};font-size:10px">[${lvl.toUpperCase()}]</span>
+    <span style="color:#555">${e.channel ?? ""}</span>
+    <span style="color:${kindColor}">${e.kind ?? ""}</span>
+    <span style="color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fields}</span>
+  </div>`;
 }
 
 async function renderLogs(source) {
@@ -1225,19 +1514,8 @@ async function renderLogs(source) {
       set(`<div class="muted">No log events today for ${source}.</div>`);
       return;
     }
-    const html = events.map(e => {
-      const fields = Object.entries(e)
-        .filter(([k]) => !["ts", "channel", "kind", "level", "run_id"].includes(k))
-        .map(([k, v]) => `<span class="log-field">${k}=<b>${
-          typeof v === 'object' ? JSON.stringify(v) : String(v)
-        }</b></span>`).join(' ');
-      return `<div class="log-line log-${(e.level ?? "info").toLowerCase()}">
-        <span class="log-ts">${fmtTimeLocal(e.ts)}</span>
-        <span class="log-channel">${e.channel}</span>
-        <span class="log-kind">${e.kind}</span>${fields}
-      </div>`;
-    }).join("");
-    set(`<div class="card"><div class="logs">${html}</div></div>`);
+    const html = events.map(_fmtLogRow).join("");
+    set(`<div class="card"><div style="padding:4px 0">${html}</div></div>`);
   } catch (e) {
     set(`<div class="neg">Error: ${e.message}</div>`);
   }

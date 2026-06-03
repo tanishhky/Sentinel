@@ -527,18 +527,66 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
                 except Exception:
                     pass
 
+            # Build per-trader cumulative-deployed lookup from closed trades.
+            # cum_deployed_usd at time T = sum(entry_size_usd) for trades that
+            # closed on or before T. Used by the "% Deployed" returns metric:
+            # return = closed_pnl / cum_deployed (excludes open positions).
+            import bisect as _bisect
+
+            cum_dep_lookups: dict[str, list[tuple[float, float]]] = {}
+            trades_path = data_dir / "paper_trades.parquet"
+            if trades_path.exists():
+                try:
+                    tdf = pd.read_parquet(trades_path)
+                    closed_tdf = tdf[
+                        (tdf["status"] != "open") & tdf["exit_ts"].notna()
+                    ].copy()
+                    if not closed_tdf.empty and "trader" in closed_tdf.columns:
+                        closed_tdf["entry_size_usd"] = (
+                            closed_tdf["entry_size_usd"].fillna(0.0))
+                        for tid, grp_t in closed_tdf.groupby("trader"):
+                            grp_t = grp_t.sort_values("exit_ts")
+                            grp_t["cum"] = grp_t["entry_size_usd"].cumsum()
+                            pts: list[tuple[float, float]] = []
+                            for _, tr in grp_t.iterrows():
+                                try:
+                                    ep = pd.Timestamp(tr["exit_ts"]).timestamp()
+                                    pts.append((ep, float(tr["cum"])))
+                                except Exception:
+                                    pass
+                            cum_dep_lookups[str(tid)] = pts
+                except Exception:
+                    pass
+
+            def _cum_dep_at(lookup: list, ts_val) -> float:
+                if not lookup:
+                    return 0.0
+                try:
+                    ep = pd.Timestamp(ts_val).timestamp()
+                except Exception:
+                    return 0.0
+                idx = _bisect.bisect_right([p[0] for p in lookup], ep) - 1
+                return lookup[idx][1] if idx >= 0 else 0.0
+
             series: dict[str, list[dict[str, Any]]] = {}
             for trader, grp in edf.groupby("trader"):
                 grp = grp.sort_values("ts")
+                lookup = cum_dep_lookups.get(str(trader), [])
                 series[str(trader)] = [
                     {"ts": str(r["ts"]),
                      "equity": round(float(r["total_equity_usd"]), 2),
+                     "cash": round(float(r["cash_usd"]), 2),
+                     "exposure": round(float(r["open_exposure_usd"]), 2),
+                     "closed_pnl": round(float(r["closed_pnl_usd"]), 2),
+                     "cum_deployed_usd": round(_cum_dep_at(lookup, r["ts"]), 2),
                      "drawdown_pct": round(float(r["drawdown_pct"]), 3),
                      "mtm": round(float(r["mtm_unrealized_usd"]), 2)}
                     for _, r in grp.iterrows()
                 ]
             return {"status": "ok", "series": series,
-                    "bankrolls": bankrolls or {"kelly": 10000, "equal": 10000, "volwt": 10000},
+                    "bankrolls": bankrolls or {"kelly": 10000, "equal": 10000,
+                                               "volwt": 10000, "volharvest": 10000,
+                                               "resolution": 10000},
                     "source": "equity_history"}
 
     # ── Fallback: reconstruct from trades when no equity_history yet ──
