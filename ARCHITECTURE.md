@@ -43,6 +43,19 @@ This document is the **load-bearing answer** to the question "why are there thre
 
 5. **PinSight and DriftEdge are allowed to evolve independently** of Sentinel. They have no awareness of who is reading their data.
 
+## DriftEdge data files read by Sentinel
+
+| File | Writer | Contents |
+|---|---|---|
+| `data/paper_trades.parquet` | DriftEdge | Every paper trade: entry/exit price, size, PnL, trader |
+| `data/paper_equity_history.parquet` | DriftEdge | Per-trader equity snapshots: equity, cash, exposure, closed_pnl, drawdown_pct, mtm_unrealized_usd |
+| `data/paper_state.parquet` | DriftEdge | Current portfolio state per trader (bankroll, cash, open_exposure, closed_pnl, peak_equity) |
+| `data/markets/polymarket/*.parquet` | DriftEdge | Polymarket market snapshots |
+| `data/markets/kalshi/*.parquet` | DriftEdge | Kalshi market snapshots |
+| `logs/*.jsonl` | DriftEdge | Structured JSONL event logs |
+
+5 active traders as of 2026-06-02: `kelly`, `equal`, `volwt`, `volharvest`, `resolution`. Each starts at $10k bankroll. Sentinel's `readers.py` joins `paper_equity_history` with `paper_trades` to compute `cum_deployed_usd` per equity point (bisect join on epoch-seconds).
+
 ## What this means in practice
 
 | Question | Answer |
@@ -78,7 +91,7 @@ If you find yourself writing trading logic in Sentinel, stop. It belongs in the 
 | Job label | Owned by | What it runs |
 |---|---|---|
 | `com.tanishk.pinsight.{morning,midday,close}` | PinSight | scheduled chain fetches |
-| `com.tanishk.driftedge.poll` | DriftEdge | continuous polling daemon |
+| `com.tanishk.driftedge.poll` | DriftEdge | continuous polling daemon (Polymarket + Kalshi + 5-trader paper tick) |
 | `com.tanishk.sentinel` | Sentinel | FastAPI server on `:8765` |
 
 Each project's `scripts/launchd/` directory ships its own plist. Each install script in each repo manages only its own launchd jobs.
