@@ -144,7 +144,7 @@ def create_app() -> FastAPI:
         return readers.sentinel_health(
             c.pinsight_data, c.pinsight_logs,
             c.driftedge_data, c.driftedge_logs,
-            Path("/Users/tanishkyadav/dev/Sentinel/logs"),
+            Path(__file__).resolve().parents[3] / "logs",
         )
 
     @app.get("/api/driftedge/market/{venue}/{market_id:path}")

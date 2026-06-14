@@ -35,3 +35,6 @@ Thumbs.db
 # ── Logs (Sentinel's own) ──────────────────────────────────────────────────
 /logs/
 !/logs/.gitkeep
+
+# machine-specific launchd config (absolute paths) — keep local only
+scripts/launchd/*.plist

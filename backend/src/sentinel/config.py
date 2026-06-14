@@ -9,6 +9,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Default to sibling repos checked out alongside Sentinel (../PinSight, ../DriftEdge).
+# Override any of these with the matching *_DIR environment variable (see .env.example).
+_SIBLINGS = Path(__file__).resolve().parents[4]
+
 
 @dataclass(frozen=True)
 class Config:
@@ -25,19 +29,19 @@ def load() -> Config:
     return Config(
         pinsight_data=Path(os.getenv(
             "PINSIGHT_DATA_DIR",
-            "/Users/tanishkyadav/dev/PinSight/data"
+            str(_SIBLINGS / "PinSight" / "data")
         )).resolve(),
         pinsight_logs=Path(os.getenv(
             "PINSIGHT_LOG_DIR",
-            "/Users/tanishkyadav/dev/PinSight/logs"
+            str(_SIBLINGS / "PinSight" / "logs")
         )).resolve(),
         driftedge_data=Path(os.getenv(
             "DRIFTEDGE_DATA_DIR",
-            "/Users/tanishkyadav/dev/DriftEdge/data"
+            str(_SIBLINGS / "DriftEdge" / "data")
         )).resolve(),
         driftedge_logs=Path(os.getenv(
             "DRIFTEDGE_LOG_DIR",
-            "/Users/tanishkyadav/dev/DriftEdge/logs"
+            str(_SIBLINGS / "DriftEdge" / "logs")
         )).resolve(),
         host=os.getenv("SENTINEL_HOST", "127.0.0.1"),
         port=int(os.getenv("SENTINEL_PORT", "8765")),
