@@ -102,10 +102,10 @@ Symbology consistency: currency always `$X.XX`, percentages always `+/-X.XXX%`, 
 
 `.env` (see `.env.example`):
 ```
-PINSIGHT_DATA_DIR=/Users/tanishkyadav/dev/PinSight/data
-PINSIGHT_LOG_DIR=/Users/tanishkyadav/dev/PinSight/logs
-DRIFTEDGE_DATA_DIR=/Users/tanishkyadav/dev/DriftEdge/data
-DRIFTEDGE_LOG_DIR=/Users/tanishkyadav/dev/DriftEdge/logs
+PINSIGHT_DATA_DIR=/path/to/PinSight/data
+PINSIGHT_LOG_DIR=/path/to/PinSight/logs
+DRIFTEDGE_DATA_DIR=/path/to/DriftEdge/data
+DRIFTEDGE_LOG_DIR=/path/to/DriftEdge/logs
 SENTINEL_PORT=8765
 ```
 

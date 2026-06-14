@@ -30,10 +30,10 @@ This document is the **load-bearing answer** to the question "why are there thre
 
 2. **Sentinel references PinSight and DriftEdge by local filesystem path**, configured via environment variables in `.env`:
    ```
-   PINSIGHT_DATA_DIR=/Users/tanishkyadav/dev/PinSight/data
-   PINSIGHT_LOG_DIR=/Users/tanishkyadav/dev/PinSight/logs
-   DRIFTEDGE_DATA_DIR=/Users/tanishkyadav/dev/DriftEdge/data
-   DRIFTEDGE_LOG_DIR=/Users/tanishkyadav/dev/DriftEdge/logs
+   PINSIGHT_DATA_DIR=/path/to/PinSight/data
+   PINSIGHT_LOG_DIR=/path/to/PinSight/logs
+   DRIFTEDGE_DATA_DIR=/path/to/DriftEdge/data
+   DRIFTEDGE_LOG_DIR=/path/to/DriftEdge/logs
    ```
    Move either project, update the env var. That's it.
 

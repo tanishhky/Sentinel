@@ -71,7 +71,7 @@ Committed to the engine repo. Sentinel discovers an engine by reading its manife
   "description": "Prediction markets multi-trader paper engine",
   "owner": "tanishk",
   "repo_url": "https://github.com/tanishhky/DriftEdge",
-  "repo_path": "/Users/tanishkyadav/dev/DriftEdge"
+  "repo_path": "/path/to/DriftEdge"
 }
 ```
 
@@ -83,11 +83,11 @@ All paths absolute. Sentinel never traverses up from these.
 
 ```json
 {
-  "data_dir": "/Users/tanishkyadav/dev/DriftEdge/data",
-  "log_dir":  "/Users/tanishkyadav/dev/DriftEdge/logs",
-  "allocations_file": "/Users/tanishkyadav/dev/DriftEdge/manifest/allocations.json",
-  "state_file":       "/Users/tanishkyadav/dev/DriftEdge/data/state.json",
-  "audit_log":        "/Users/tanishkyadav/dev/DriftEdge/logs/allocation-audit.jsonl"
+  "data_dir": "/path/to/DriftEdge/data",
+  "log_dir":  "/path/to/DriftEdge/logs",
+  "allocations_file": "/path/to/DriftEdge/manifest/allocations.json",
+  "state_file":       "/path/to/DriftEdge/data/state.json",
+  "audit_log":        "/path/to/DriftEdge/logs/allocation-audit.jsonl"
 }
 ```
 
@@ -356,8 +356,8 @@ Sentinel maintains a single registry file:
 ```json
 {
   "engines": [
-    { "id": "pinsight",  "manifest_path": "/Users/tanishkyadav/dev/PinSight/manifest/manifest.json" },
-    { "id": "driftedge", "manifest_path": "/Users/tanishkyadav/dev/DriftEdge/manifest/manifest.json" }
+    { "id": "pinsight",  "manifest_path": "/path/to/PinSight/manifest/manifest.json" },
+    { "id": "driftedge", "manifest_path": "/path/to/DriftEdge/manifest/manifest.json" }
   ]
 }
 ```
