@@ -629,13 +629,15 @@ async function renderPSPaper() {
     }
     const s = d.summary;
     const tr = (s.by_trader && s.by_trader.edge_buyer) || {};
+    // total_equity is MTM-based when equity_history is available
+    // (Bug 5 fix 2026-06-05); falls back to cost-basis otherwise.
     const retPct = tr.bankroll_init
-      ? ((tr.total_equity || 0) / tr.bankroll_init - 1) * 100 + (tr.closed_pnl || 0) / tr.bankroll_init * 100 - (tr.closed_pnl || 0) / tr.bankroll_init * 100
+      ? ((tr.total_equity || 0) / tr.bankroll_init - 1) * 100
       : null;
     const realisedPct = tr.bankroll_init
       ? ((tr.closed_pnl || 0) / tr.bankroll_init * 100)
       : null;
-    const retClass = signClass(realisedPct);
+    const retClass = signClass(retPct);
 
     set(`
       <div class="grid grid-4" style="margin-bottom:16px">

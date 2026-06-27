@@ -69,7 +69,13 @@ def pinsight_latest_chain(data_dir: Path) -> dict[str, Any]:
 
 
 def pinsight_paper(data_dir: Path) -> dict[str, Any]:
-    """PinSight paper trader state + positions (same shape as DriftEdge)."""
+    """PinSight paper trader state + positions (same shape as DriftEdge).
+
+    Schema-tolerant: supports the post-2026-06-03 cost-aware schema
+    (entry_fill_price, entry_total_cost_usd, expected_pnl_at_entry_gross,
+    peak_market_equity, etc.) AND the legacy pre-fix schema
+    (entry_price, entry_size_usd, expected_pnl_at_entry, peak_equity).
+    """
     trades_path = data_dir / "paper_trades.parquet"
     state_path = data_dir / "paper_state.parquet"
     if not trades_path.exists():
@@ -81,19 +87,49 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
     if df.empty:
         return {"status": "no_data"}
 
+    def _pick(r, *names):
+        """Return the first present + non-null value from a list of column names."""
+        for n in names:
+            v = r.get(n) if hasattr(r, "get") else (r[n] if n in r else None)
+            if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                return v
+        return None
+
+    def _f(v, default=None):
+        """Float-coerce that returns `default` on NaN/Inf so the JSON
+        response is always strict-JSON compliant. FastAPI's JSONResponse
+        uses json.dumps with allow_nan=False and rejects NaN/Inf with
+        500. (Bug fix 2026-06-08.)"""
+        if v is None:
+            return default
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return default
+        import math
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+
     state: dict[str, Any] = {}
     if state_path.exists():
         try:
             st = pd.read_parquet(state_path)
             for _, r in st.iterrows():
+                peak = _f(_pick(r, "peak_market_equity", "peak_equity"), 0.0)
+                # Prefer the explicit current_market_equity column;
+                # fall back to cash+open_exposure (cost basis).
+                cur_eq = _f(_pick(r, "current_market_equity"))
+                if cur_eq is None:
+                    cur_eq = _f(r.get("cash_usd"), 0.0) + _f(r.get("open_exposure"), 0.0)
                 state[str(r["trader"])] = {
-                    "bankroll_init": float(r["bankroll_init"]),
-                    "cash_usd": round(float(r["cash_usd"]), 2),
-                    "open_exposure": round(float(r["open_exposure"]), 2),
-                    "closed_pnl": round(float(r["closed_pnl"]), 2),
-                    "peak_equity": round(float(r["peak_equity"]), 2),
-                    "drawdown_pct": round(float(r["current_drawdown_pct"]), 3),
-                    "total_equity": round(float(r["cash_usd"]) + float(r["open_exposure"]), 2),
+                    "bankroll_init": _f(r.get("bankroll_init"), 0.0),
+                    "cash_usd": round(_f(r.get("cash_usd"), 0.0), 2),
+                    "open_exposure": round(_f(r.get("open_exposure"), 0.0), 2),
+                    "closed_pnl": round(_f(r.get("closed_pnl"), 0.0), 2),
+                    "peak_equity": round(_f(peak, 0.0), 2),
+                    "drawdown_pct": round(_f(r.get("current_drawdown_pct"), 0.0), 3),
+                    "total_equity": round(_f(cur_eq, 0.0), 2),
                 }
         except Exception:
             pass
@@ -102,6 +138,11 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
     closed_df = df[df["status"] != "open"]
 
     def _row(r) -> dict:
+        entry_fill = _pick(r, "entry_fill_price", "entry_price")
+        size_usd = _pick(r, "entry_total_cost_usd", "entry_notional_usd",
+                          "entry_size_usd")
+        exp_pnl = _pick(r, "expected_pnl_at_entry_gross",
+                         "expected_pnl_at_entry")
         return {
             "trade_id": r.get("trade_id"),
             "kind": r.get("kind"),
@@ -110,16 +151,22 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
             "expiry": r.get("expiry"),
             "entry_ts": str(r.get("entry_ts")) if r.get("entry_ts") else None,
             "exit_ts": str(r.get("exit_ts")) if pd.notna(r.get("exit_ts")) else None,
-            "entry_price": round(float(r["entry_price"]), 4) if pd.notna(r.get("entry_price")) else None,
+            "entry_price": round(float(entry_fill), 4) if entry_fill is not None else None,
+            "entry_mid": (round(float(r["entry_mid"]), 4)
+                          if pd.notna(r.get("entry_mid")) else None),
             "exit_price": round(float(r["exit_price"]), 4) if pd.notna(r.get("exit_price")) else None,
             "n_contracts": int(r["n_contracts"]) if pd.notna(r.get("n_contracts")) else None,
-            "size_usd": round(float(r["entry_size_usd"]), 2) if pd.notna(r.get("entry_size_usd")) else None,
+            "size_usd": round(float(size_usd), 2) if size_usd is not None else None,
+            "entry_commission_usd": (round(float(r["entry_commission_usd"]), 2)
+                                       if pd.notna(r.get("entry_commission_usd")) else None),
+            "exit_commission_usd": (round(float(r["exit_commission_usd"]), 2)
+                                       if pd.notna(r.get("exit_commission_usd")) else None),
             "spot_at_entry": round(float(r["spot_at_entry"]), 2) if pd.notna(r.get("spot_at_entry")) else None,
             "spot_at_exit": round(float(r["spot_at_exit"]), 2) if pd.notna(r.get("spot_at_exit")) else None,
             "fair_at_entry": round(float(r["fair_at_entry"]), 4) if pd.notna(r.get("fair_at_entry")) else None,
             "edge_at_entry": round(float(r["edge_at_entry"]), 3) if pd.notna(r.get("edge_at_entry")) else None,
             "prob_itm_at_entry": round(float(r["prob_itm_at_entry"]), 3) if pd.notna(r.get("prob_itm_at_entry")) else None,
-            "expected_pnl_at_entry": round(float(r["expected_pnl_at_entry"]), 3) if pd.notna(r.get("expected_pnl_at_entry")) else None,
+            "expected_pnl_at_entry": round(float(exp_pnl), 3) if exp_pnl is not None else None,
             "status": r.get("status"),
             "exit_reason": r.get("exit_reason"),
             "pnl_usd": round(float(r["pnl_usd"]), 2) if pd.notna(r.get("pnl_usd")) else None,
@@ -147,6 +194,13 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
 
 
 def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
+    """Schema-tolerant: prefer total_equity_market_usd (post-2026-06-03
+    cost-aware schema) and fall back to total_equity_usd (legacy).
+
+    NaN-safe: any malformed row (NaN in every equity column, NaN drawdown,
+    etc.) is either repaired with a sensible fallback or dropped. The
+    JSON layer rejects NaN, so we must never let one through.
+    """
     eq_path = data_dir / "equity_history.parquet"
     if not eq_path.exists():
         return {"status": "no_data"}
@@ -156,16 +210,71 @@ def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
         return {"status": "error", "err": str(exc)}
     if df.empty:
         return {"status": "no_data"}
+
+    def _isnum(v) -> bool:
+        """Truthy iff v is a finite number (not None, not NaN, not Inf)."""
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return f == f and f not in (float("inf"), float("-inf"))
+
+    def _num(v, default: float = 0.0) -> float:
+        return float(v) if _isnum(v) else float(default)
+
+    def _equity_value(row) -> Optional[float]:
+        # Try every equity column in order; first finite value wins.
+        for col in ("total_equity_market_usd", "total_equity_usd",
+                     "total_equity_fair_usd"):
+            v = row.get(col) if hasattr(row, "get") else None
+            if _isnum(v):
+                return float(v)
+        # Last-resort reconstruction: cash + (mtm if finite, else 0).
+        cash = row.get("cash_usd")
+        if not _isnum(cash):
+            return None  # signal: cannot reconstruct this row
+        mtm_col = row.get("sum_current_market_value_usd")
+        if not _isnum(mtm_col):
+            mtm_col = row.get("sum_mtm_market_usd")
+        return float(cash) + _num(mtm_col, 0.0)
+
     series: dict[str, list[dict]] = {}
+    dropped = 0
     for trader, grp in df.groupby("trader"):
         grp = grp.sort_values("ts")
-        series[str(trader)] = [
-            {"ts": str(r["ts"]),
-             "equity": round(float(r["total_equity_usd"]), 2),
-             "drawdown_pct": round(float(r["drawdown_pct"]), 3)}
-            for _, r in grp.iterrows()
-        ]
-    return {"status": "ok", "series": series}
+        rows: list[dict] = []
+        last_good_equity: Optional[float] = None
+        for _, r in grp.iterrows():
+            eq = _equity_value(r)
+            if eq is None:
+                # No equity could be derived. Reuse the prior point's
+                # equity if we have one; otherwise drop the row entirely.
+                if last_good_equity is None:
+                    dropped += 1
+                    continue
+                eq = last_good_equity
+            else:
+                last_good_equity = eq
+            point = {
+                "ts": str(r["ts"]),
+                "equity": round(eq, 2),
+                "drawdown_pct": round(_num(r.get("drawdown_pct"), 0.0), 3),
+            }
+            # Expose the dual MTM columns when present and finite.
+            if _isnum(r.get("sum_mtm_fair_usd")):
+                point["mtm_fair_usd"] = round(float(r["sum_mtm_fair_usd"]), 2)
+            if _isnum(r.get("sum_mtm_market_usd")):
+                point["mtm_market_usd"] = round(float(r["sum_mtm_market_usd"]), 2)
+            if _isnum(r.get("total_equity_fair_usd")):
+                point["equity_fair"] = round(float(r["total_equity_fair_usd"]), 2)
+            rows.append(point)
+        series[str(trader)] = rows
+    payload: dict[str, Any] = {"status": "ok", "series": series}
+    if dropped:
+        payload["dropped_rows"] = dropped
+    return payload
 
 
 def pinsight_chain_full(data_dir: Path, top_contracts: int = 30) -> dict[str, Any]:
@@ -360,10 +469,40 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
                     "cash_usd": round(float(r["cash_usd"]), 2),
                     "open_exposure": round(float(r["open_exposure"]), 2),
                     "closed_pnl": round(float(r["closed_pnl"]), 2),
-                    "total_equity": round(float(r["cash_usd"]) + float(r["open_exposure"]), 2),
+                    # Cost-basis equity (kept for backwards-compat consumers
+                    # — frontend uses `total_equity` below which now
+                    # prefers MTM).
+                    "total_equity_cost_basis": round(
+                        float(r["cash_usd"]) + float(r["open_exposure"]), 2),
                     "peak_equity": round(float(r["peak_equity"]), 2),
                     "drawdown_pct": round(float(r["current_drawdown_pct"]), 3),
                 }
+        except Exception:
+            pass
+
+    # ── MTM equity from the latest equity_history row per trader ──
+    # Bug 5 fix (2026-06-05): the dashboard's `return_pct` was previously
+    # computed from cost-basis equity, which equals bankroll_init +
+    # closed_pnl — i.e., displayed return excluded unrealized MTM. Sourcing
+    # equity from equity_history.parquet gives the user the real total.
+    equity_path = data_dir / "equity_history.parquet"
+    mtm_equity_by_trader: dict[str, float] = {}
+    if equity_path.exists():
+        try:
+            eq = pd.read_parquet(equity_path)
+            if not eq.empty and "trader" in eq.columns and "ts" in eq.columns:
+                eq = eq.sort_values("ts")
+                # Prefer the new MTM column; fall back to legacy name.
+                eq_col = ("total_equity_market_usd"
+                          if "total_equity_market_usd" in eq.columns
+                          else ("total_equity_usd"
+                                if "total_equity_usd" in eq.columns else None))
+                if eq_col is not None:
+                    latest = eq.groupby("trader").tail(1)
+                    for _, r in latest.iterrows():
+                        v = r[eq_col]
+                        if pd.notna(v):
+                            mtm_equity_by_trader[str(r["trader"])] = round(float(v), 2)
         except Exception:
             pass
 
@@ -380,10 +519,15 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
         t_open = t_df[t_df["status"] == "open"]
         t_closed = t_df[t_df["status"] != "open"]
         state = state_by_trader.get(t, {})
-        equity = state.get("total_equity")
         bankroll = state.get("bankroll_init")
+        # Prefer MTM equity for the headline total_equity / return_pct.
+        # Falls back to cost-basis if equity_history has no row yet.
+        mtm_equity = mtm_equity_by_trader.get(t)
+        cost_equity = state.get("total_equity_cost_basis")
+        total_equity = mtm_equity if mtm_equity is not None else cost_equity
         by_trader[t] = {
             **state,
+            "total_equity": total_equity,
             "total_trades": len(t_df),
             "open_count": len(t_open),
             "closed_count": len(t_closed),
@@ -398,8 +542,8 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
                 if "entry_size_usd" in t_df.columns and not t_df.empty else None
             ),
             "return_pct": (
-                round((equity / bankroll - 1) * 100, 3)
-                if (equity is not None and bankroll) else None
+                round((total_equity / bankroll - 1) * 100, 3)
+                if (total_equity is not None and bankroll) else None
             ),
         }
 
