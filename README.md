@@ -6,15 +6,17 @@ Sentinel is a thin viewing layer over the data accumulated by [PinSight](https:/
 
 **Sentinel does not trade. Sentinel does not produce signals. Sentinel only shows.**
 
-**Sentinel does NOT contain any code from PinSight or DriftEdge.** Both projects live in their own repos at `~/dev/PinSight` and `~/dev/DriftEdge`. Sentinel references them by filesystem path via environment variables and reads their Parquet/JSONL artifacts. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the contract that keeps the three repos cleanly separated.
+**Sentinel does NOT contain any code from PinSight or DriftEdge.** Both projects live in their own repos at `~/Documents/SecondBrain/GitHub/PinSight` and `~/Documents/SecondBrain/GitHub/DriftEdge`. Sentinel references them by filesystem path via environment variables and reads their Parquet/JSONL artifacts. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the contract that keeps the three repos cleanly separated.
 
 ## Status
 
 **v0.7 shipped (2026-06-02):** 5-trader race (Kelly / Equal / Vol-Wt / VolHarvest / Resolution), RETURNS tab with 4-mode chart (abs / % bankroll / Closed-Closed / Open-Open), floating ⓘ tooltips explaining each return formula, per-agent risk/distribution cards with colored borders, single-line compact log rows, near-certain market filter (drops ask ≤ 0.05 or ≥ 0.95), PWA manifest + service worker for one-click install.
 
+> **Note (2026-06):** the **Resolution** trader in DriftEdge is now **quarantined** (default off) after an audit found it had no edge (it bought YES on any near-resolution market with no probability estimate and bled badly). It still appears in Sentinel's schema and colors but sits idle until re-enabled with a real signal. DriftEdge's paper ledgers were reset at the same time, so equity curves start fresh.
+
 **v0.6 shipped (2026-06-01):** Two-level tabbed navigation, Bloomberg Amber theme, ET timezones everywhere, cache-busted static assets, clickable market detail modal, all closed positions with ET timestamps, BY CATEGORY panel, system health page, mark-to-market equity curve, NEWS tab with VADER sentiment scoring.
 
-**Operationally:** the project lives at `~/dev/Sentinel/`. A launchd job auto-starts the FastAPI server on login. Open <http://127.0.0.1:8765> — or install as a desktop app (see [PWA install](#pwa-install) below).
+**Operationally:** the project lives at `~/Documents/SecondBrain/GitHub/Sentinel/`. A launchd job auto-starts the FastAPI server on login. Open <http://127.0.0.1:8765> — or install as a desktop app (see [PWA install](#pwa-install) below).
 
 ## UI structure
 
@@ -113,7 +115,7 @@ SENTINEL_PORT=8765
 
 Manually:
 ```
-cd ~/dev/Sentinel/backend
+cd ~/Documents/SecondBrain/GitHub/Sentinel/backend
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/python -m sentinel.server
