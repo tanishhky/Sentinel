@@ -35,29 +35,52 @@ let activeTop = "dashboard";
 let activeSub = { pinsight: "paper", driftedge: "paper", sentinel: "health" };
 let refreshTimer = null;
 let chartRegistry = {};
+let renderInFlight = false;      // prevents overlapping refresh cycles
+let fetchCtl = new AbortController();  // aborted on tab switch
+let connOk = null;               // null until first status poll resolves
+let engineStatus = null;         // last /api/status payload
+let lastUpdText = "—";           // last successful content refresh (ET)
 
-const TRADER_COLORS = {
-  kelly:      "#ff9000",
-  equal:      "#00d4ff",
-  volwt:      "#ff66cc",
-  volharvest: "#88ff66",
-  resolution: "#ff4466",
+// Known-trader presentation metadata. Anything NOT listed still renders
+// (deterministic fallback color, id as label): the roster itself comes from
+// the API (equity-history active_traders), so engine retirements/additions
+// need no Sentinel edit.
+const TRADER_META = {
+  kelly:      { color: "#ff9000", label: "KELLY",       desc: "Calibrated fractional Kelly · EV-gated" },
+  equal:      { color: "#00d4ff", label: "EQUAL-WT",    desc: "Fixed 2% per trade · evidence baseline" },
+  volharvest: { color: "#88ff66", label: "VOL-HARVEST", desc: "Underdog YES + early-exit harvest · adaptive horizon" },
+  volwt:      { color: "#ff66cc", label: "VOL-WT",      desc: "RETIRED 2026-07-04 · duplicate of EQUAL" },
+  resolution: { color: "#ff4466", label: "RESOLUTION",  desc: "RETIRED 2026-07-04 · no edge" },
+  edge_buyer: { color: "#88ff66", label: "EDGE_BUYER",  desc: "RND edge buyer · divergence-gated · Kelly-sized" },
 };
-const TRADER_LABELS = {
-  kelly:      "KELLY",
-  equal:      "EQUAL-WT",
-  volwt:      "VOL-WT",
-  volharvest: "VOL-HARVEST",
-  resolution: "RESOLUTION",
-};
-const TRADER_DESC = {
-  kelly:      "Quarter-Kelly · p=0.45",
-  equal:      "Fixed 2% per trade",
-  volwt:      "Inverse-σ weighted",
-  volharvest: "Underdog YES + synthetic-NO hedge",
-  resolution: "Hold-to-binary · entry [0.25, 0.50] · ≤72 h horizon",
-};
-const ALL_TRADERS = ["kelly", "equal", "volwt", "volharvest", "resolution"];
+const FALLBACK_PALETTE = ["#ffd700", "#7fffd4", "#ff8c69", "#b0e0e6", "#dda0dd", "#98fb98"];
+let ROSTER = ["kelly", "equal", "volharvest"];  // refreshed from API payloads
+
+function traderColor(t) {
+  if (TRADER_META[t]) return TRADER_META[t].color;
+  let h = 0;
+  for (const ch of String(t)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return FALLBACK_PALETTE[h % FALLBACK_PALETTE.length];
+}
+function traderLabel(t) { return TRADER_META[t] ? TRADER_META[t].label : String(t).toUpperCase(); }
+function traderDesc(t)  { return TRADER_META[t] ? TRADER_META[t].desc : ""; }
+
+// Derive the active roster from API payloads. Preference order: the
+// backend's active_traders (recency-based, excludes retired), then the
+// union of series/by_trader keys as a fallback.
+function updateRoster(eq, paper) {
+  let r = (eq && eq.active_traders && eq.active_traders.length)
+    ? [...eq.active_traders] : null;
+  if (!r) {
+    const keys = new Set();
+    if (eq && eq.series) Object.keys(eq.series).forEach(k => keys.add(k));
+    if (paper && paper.summary && paper.summary.by_trader)
+      Object.keys(paper.summary.by_trader).forEach(k => keys.add(k));
+    r = [...keys];
+  }
+  if (r.length) ROSTER = r.sort();
+  return ROSTER;
+}
 
 function init() {
   const topTabsEl = document.getElementById("top-tabs");
@@ -65,7 +88,7 @@ function init() {
     const b = document.createElement("button");
     b.className = "tab" + (t.id === activeTop ? " active" : "");
     b.textContent = t.label;
-    b.onclick = () => { activeTop = t.id; rerender(); };
+    b.onclick = () => { activeTop = t.id; navigate(); };
     topTabsEl.appendChild(b);
   });
 
@@ -74,12 +97,36 @@ function init() {
     clock.textContent = fmtTsLocal(new Date()) + " ET";
   }, 1000);
 
-  rerender();
+  renderChrome();
+  refreshContent(true);
+  pollStatus();
   if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(rerender, 5000);
+  refreshTimer = setInterval(() => refreshContent(false), 5000);
+  setInterval(pollStatus, 5000);
+
+  // Catch up immediately when the tab regains focus instead of waiting
+  // for the next interval tick.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) { refreshContent(true); pollStatus(); }
+  });
 }
 
-function rerender() {
+function tabKey() {
+  return activeTop + ":" + (activeSub[activeTop] || "");
+}
+
+// User navigation: abort any in-flight fetches so a slow response for the
+// old tab can't overwrite the new tab's content, then render immediately.
+function navigate() {
+  fetchCtl.abort();
+  fetchCtl = new AbortController();
+  renderInFlight = false;
+  renderChrome();
+  refreshContent(true);
+}
+
+// Tab/subtab chrome is rebuilt only on navigation, not on refresh ticks.
+function renderChrome() {
   document.querySelectorAll("#top-tabs .tab").forEach((el, i) => {
     el.classList.toggle("active", TOP_TABS[i].id === activeTop);
   });
@@ -92,27 +139,34 @@ function rerender() {
       const b = document.createElement("button");
       b.className = "subtab" + (s.id === activeSub[activeTop] ? " active" : "");
       b.textContent = s.label;
-      b.onclick = () => { activeSub[activeTop] = s.id; rerender(); };
+      b.onclick = () => { activeSub[activeTop] = s.id; navigate(); };
       subTabsEl.appendChild(b);
     });
     subTabsEl.style.display = "";
   } else {
     subTabsEl.style.display = "none";
   }
+}
 
-  Object.values(chartRegistry).forEach(c => { try { c.destroy(); } catch (e) {} });
-  chartRegistry = {};
-
-  if (activeTop === "dashboard") {
-    renderDashboard();
-  } else {
-    const sub = subs.find(s => s.id === activeSub[activeTop]);
-    if (sub) sub.render();
+async function refreshContent(force) {
+  if (renderInFlight) return;              // never overlap refresh cycles
+  if (!force && document.hidden) return;   // don't burn cycles in background
+  renderInFlight = true;
+  try {
+    if (activeTop === "dashboard") {
+      await renderDashboard();
+    } else {
+      const subs = SUB_TABS[activeTop];
+      const sub = subs && subs.find(s => s.id === activeSub[activeTop]);
+      if (sub) await sub.render();
+    }
+  } finally {
+    renderInFlight = false;
   }
 }
 
 async function jget(path) {
-  const r = await fetch(path);
+  const r = await fetch(path, { signal: fetchCtl.signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
@@ -142,8 +196,106 @@ function fmtTimeLocal(d) {
   }).format(d);
 }
 
+// Atomic content swap. Charts are destroyed only here — i.e. only once the
+// replacement HTML is fully built from fetched data — so the old charts stay
+// painted right up to the single-frame swap. This is what stops the
+// "graph disappears then reappears" flash on every refresh tick.
 function set(html) {
-  document.getElementById("content").innerHTML = html;
+  Object.values(chartRegistry).forEach(c => { try { c.destroy(); } catch (e) {} });
+  chartRegistry = {};
+  const content = document.getElementById("content");
+  content.innerHTML = html;
+  content.dataset.tab = tabKey();
+  markUpdated();
+}
+
+// Soft variant for "no data yet" branches: if this tab already shows real
+// content, keep it (a transient empty/error payload mid-write must not wipe
+// a working view). Only paints the message when the tab has nothing yet.
+function setSoft(html) {
+  const content = document.getElementById("content");
+  if (content.dataset.tab === tabKey()) return;
+  set(html);
+}
+
+// Fetch/render failure: keep the last good view, light the banner. Only
+// paints the error when the tab has no content at all (first load).
+function renderError(e) {
+  if (e && e.name === "AbortError") return;  // navigation cancelled us
+  console.warn("[sentinel] refresh failed:", e);
+  noteConnection(false);
+  const content = document.getElementById("content");
+  if (content.dataset.tab === tabKey()) return;
+  content.innerHTML = `<div class="neg">Error: ${e.message}</div>`;
+  content.dataset.tab = tabKey();
+}
+
+function noteConnection(ok) {
+  connOk = ok;
+  const banner = document.getElementById("conn-banner");
+  if (banner) banner.hidden = !!ok;
+}
+
+function markUpdated() {
+  noteConnection(true);
+  lastUpdText = fmtTimeLocal(new Date());
+  const el = document.getElementById("last-upd");
+  if (el) el.textContent = "UPD " + lastUpdText;
+}
+
+// ───── Header status lights ─────
+
+const STATE_LABEL = {
+  live: "LIVE", idle: "IDLE", error: "ERROR",
+  stopped: "STOPPED", unknown: "?",
+};
+
+function fmtAge(s) {
+  if (s == null) return "never";
+  if (s < 90) return Math.round(s) + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h";
+  return (s / 86400).toFixed(1) + "d";
+}
+
+function statusItem(label, state, tip) {
+  return `<span class="status-item" title="${tip}">
+    <span class="dot ${state}"></span>${label}</span>`;
+}
+
+async function pollStatus() {
+  // Deliberately not on fetchCtl: tab switches must not abort the poll.
+  try {
+    const r = await fetch("/api/status");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    engineStatus = await r.json();
+    noteConnection(true);
+  } catch (e) {
+    engineStatus = null;
+    noteConnection(false);
+  }
+  renderStatusLights();
+}
+
+function renderStatusLights() {
+  const el = document.getElementById("status-lights");
+  if (!el) return;
+  const items = [];
+  items.push(statusItem("SENTINEL", connOk ? "live" : "error",
+    connOk ? "Sentinel server reachable" : "Sentinel server unreachable"));
+  for (const [label, key] of [["PINSIGHT", "pinsight"], ["DRIFTEDGE", "driftedge"]]) {
+    const e = engineStatus && engineStatus.engines && engineStatus.engines[key];
+    if (!e) {
+      items.push(statusItem(label, "unknown", "no status available"));
+      continue;
+    }
+    const tip = `${STATE_LABEL[e.state] || e.state} · last activity ` +
+      (e.age_s != null ? fmtAge(e.age_s) + " ago" : "never") +
+      (e.last_activity_ts ? ` (${fmtTsLocal(e.last_activity_ts)} ET)` : "");
+    items.push(statusItem(label, e.state, tip));
+  }
+  el.innerHTML = `<span class="status-cluster">${items.join("")}
+    <span class="status-upd" id="last-upd">UPD ${lastUpdText}</span></span>`;
 }
 
 function fmt(n, digits = 2) {
@@ -183,6 +335,9 @@ const CHART_TIME_OPTS = {
 const CHART_BASE = {
   responsive: true,
   maintainAspectRatio: false,
+  // No entry animation: charts are rebuilt on every refresh tick, and an
+  // animated rebuild reads as "the graph vanished and came back."
+  animation: false,
   interaction: { mode: "index", intersect: false },
   plugins: {
     legend: {
@@ -222,43 +377,45 @@ function mkChart(canvasId, config) {
 
 async function renderDashboard() {
   try {
-    const [paper, eq, chain, markets, health] = await Promise.all([
+    const [paper, eq, chain, markets, status] = await Promise.all([
       jget("/api/driftedge/paper"),
       jget("/api/driftedge/paper/equity-history"),
       jget("/api/pinsight/chain"),
       jget("/api/driftedge/markets?top=5"),
-      jget("/api/sentinel/health"),
+      jget("/api/status"),
     ]);
 
+    updateRoster(eq, paper);
     const s = paper.summary || {};
     const t = s.by_trader || {};
     const ps = chain?.status === "ok";
+    const de = (status.engines && status.engines.driftedge) || {};
 
     set(`
       <div class="grid grid-4" style="margin-bottom:16px">
         ${kpi("PinSight chain", ps ? chain.contracts : "—",
               ps ? `${chain.underlying} · ${chain.expiry}` : "(no chain yet)")}
         ${kpi("Spot", ps ? `$${fmt(chain.underlying_price)}` : "—")}
-        ${kpi("DriftEdge polling",
-              health.driftedge.launchd.poll.loaded ? "ACTIVE" : "STOPPED",
-              `${health.driftedge.data_size_mb} MB archived`)}
+        ${kpi("DriftEdge engine", STATE_LABEL[de.state] || "—",
+              `${de.data_size_mb ?? "—"} MB archived · last activity ${fmtAge(de.age_s)}${de.age_s != null ? " ago" : ""}`)}
         ${kpi("Paper trades", s.total_trades ?? 0,
               `${s.open_count ?? 0} open · ${s.closed_count ?? 0} closed`)}
       </div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">4-TRADER EQUITY CURVE · $10,000 BANKROLL EACH</div>
+        <div class="card-title">PORTFOLIO VALUE · ${ROSTER.length} TRADERS · $10,000 BANKROLL EACH
+          <span class="muted" style="font-weight:normal;font-size:10px">(cash + MTM of open positions)</span></div>
         <div class="chart-wrap tall"><canvas id="equityChart"></canvas></div>
       </div>
 
-      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px">
-        ${ALL_TRADERS.map(id => {
+      <div style="display:grid;grid-template-columns:repeat(${ROSTER.length},1fr);gap:12px;margin-bottom:16px">
+        ${ROSTER.map(id => {
           const x = t[id] || {};
           const ret = x.return_pct;
           const retClass = signClass(ret);
           return `<div class="card">
-            <div class="card-title" style="color:${TRADER_COLORS[id]};font-size:10px">${TRADER_LABELS[id]}</div>
-            <div class="muted mono" style="font-size:9px;margin-bottom:6px">${TRADER_DESC[id]}</div>
+            <div class="card-title" style="color:${traderColor(id)};font-size:10px">${traderLabel(id)}</div>
+            <div class="muted mono" style="font-size:9px;margin-bottom:6px">${traderDesc(id)}</div>
             <div class="kpi-value mono ${retClass}" style="font-size:16px">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
             <div class="muted mono" style="font-size:10px">$${fmt(x.total_equity ?? 0, 2)}</div>
           </div>`;
@@ -275,9 +432,9 @@ async function renderDashboard() {
       </div>
     `);
 
-    drawEquityChart("equityChart", eq);
+    drawPortfolioChart("equityChart", eq);
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -344,14 +501,14 @@ function drawHistogramChart(canvasId, dist, color) {
 function drawPortfolioChart(canvasId, eq) {
   if (eq.status !== "ok") return;
   const datasets = [];
-  for (const trader of ALL_TRADERS) {
+  for (const trader of ROSTER) {
     const series = eq.series[trader];
     if (!series || !series.length) continue;
     datasets.push({
-      label: TRADER_LABELS[trader],
+      label: traderLabel(trader),
       data: series.map(p => ({ x: p.ts, y: p.equity })),
-      borderColor: TRADER_COLORS[trader],
-      backgroundColor: TRADER_COLORS[trader] + "22",
+      borderColor: traderColor(trader),
+      backgroundColor: traderColor(trader) + "22",
       borderWidth: 2,
       pointRadius: 0,
       pointHoverRadius: 4,
@@ -380,14 +537,14 @@ function drawPortfolioChart(canvasId, eq) {
 function drawEquityChart(canvasId, eq) {
   if (eq.status !== "ok") return;
   const datasets = [];
-  for (const trader of ALL_TRADERS) {
+  for (const trader of ROSTER) {
     const series = eq.series[trader];
     if (!series || !series.length) continue;
     datasets.push({
-      label: TRADER_LABELS[trader],
+      label: traderLabel(trader),
       data: series.map(p => ({ x: p.ts, y: p.cash ?? (p.equity - (p.mtm || 0)) })),
-      borderColor: TRADER_COLORS[trader],
-      backgroundColor: TRADER_COLORS[trader] + "33",
+      borderColor: traderColor(trader),
+      backgroundColor: traderColor(trader) + "33",
       borderWidth: 1.5,
       pointRadius: 0,
       pointHoverRadius: 4,
@@ -458,7 +615,7 @@ function drawReturnsChart(canvasId, eq, mode) {
   if (eq.status !== "ok") return;
   const bankrolls = eq.bankrolls || {};
   const datasets = [];
-  for (const trader of ALL_TRADERS) {
+  for (const trader of ROSTER) {
     const series = eq.series[trader];
     if (!series || !series.length) continue;
     const bankroll = bankrolls[trader] || 10000;
@@ -484,10 +641,10 @@ function drawReturnsChart(canvasId, eq, mode) {
     }
     if (!points.length) continue;
     datasets.push({
-      label: TRADER_LABELS[trader],
+      label: traderLabel(trader),
       data: points,
-      borderColor: TRADER_COLORS[trader],
-      backgroundColor: TRADER_COLORS[trader] + "22",
+      borderColor: traderColor(trader),
+      backgroundColor: traderColor(trader) + "22",
       borderWidth: 2,
       pointRadius: 0,
       pointHoverRadius: 4,
@@ -526,6 +683,7 @@ async function renderDEReturns() {
       jget("/api/driftedge/paper/risk-stats"),
     ]);
 
+    updateRoster(eq, null);
     const bankrolls = eq.bankrolls || {};
     const modeDefs = [
       { id: "abs",          label: "$ P&L" },
@@ -534,7 +692,7 @@ async function renderDEReturns() {
       { id: "pct_open",     label: "Open/Open" },
     ];
 
-    const summaryRows = ALL_TRADERS.map(t => {
+    const summaryRows = ROSTER.map(t => {
       const r = (risk.by_trader || {})[t] || {};
       const series = (eq.series || {})[t] || [];
       const bankroll = bankrolls[t] || 10000;
@@ -551,7 +709,7 @@ async function renderDEReturns() {
       const closedCls  = signClass(closedPnl);
       const openCls    = signClass(mtm);
       return `<tr>
-        <td style="color:${TRADER_COLORS[t]};font-weight:bold">${TRADER_LABELS[t]}</td>
+        <td style="color:${traderColor(t)};font-weight:bold">${traderLabel(t)}</td>
         <td class="r ${pnlCls}">$${signFmt(totalPnl, 2)}</td>
         <td class="r ${pnlCls}">${pctBank != null ? signFmt(pctBank, 3) + "%" : "—"}</td>
         <td class="r ${closedCls}">${pctClosed != null ? signFmt(pctClosed, 2) + "%" : "<span class='muted'>—</span>"}</td>
@@ -611,7 +769,7 @@ async function renderDEReturns() {
 
     if (eq.status === "ok") drawReturnsChart("returnsChart", eq, returnsMode);
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -622,7 +780,7 @@ async function renderPSPaper() {
       jget("/api/pinsight/paper/equity-history"),
     ]);
     if (d.status !== "ok") {
-      set(`<div class="muted">No paper trades yet. The poll daemon runs the
+      setSoft(`<div class="muted">No paper trades yet. The poll daemon runs the
         edge_buyer agent every 90 s during US market hours; come back when
         the market is open.</div>`);
       return;
@@ -643,7 +801,7 @@ async function renderPSPaper() {
       <div class="grid grid-4" style="margin-bottom:16px">
         <div class="card">
           <div class="card-title" style="color:#88ff66">EDGE_BUYER</div>
-          <div class="muted mono" style="font-size:10px;margin-bottom:6px">Buy SPY 0DTE contracts where market_mid &lt; 0.85 × fair</div>
+          <div class="muted mono" style="font-size:10px;margin-bottom:6px">SPY 0DTE RND edge buyer · divergence-gated · Kelly-sized (2026-07-04)</div>
           <div class="kpi-value mono ${retClass}">${realisedPct != null ? signFmt(realisedPct, 3) + "%" : "—"}</div>
           <div class="muted mono" style="font-size:10px;margin-top:4px">Realised return on $${fmtInt(tr.bankroll_init || 0)}</div>
         </div>
@@ -739,7 +897,7 @@ async function renderPSPaper() {
       }
     }
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -750,7 +908,7 @@ async function renderPSChain() {
       jget("/api/pinsight/chain/full?top_contracts=40"),
     ]);
     if (d.status !== "ok") {
-      set(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code> or wait for the morning launchd job.</div>`);
+      setSoft(`<div class="muted">No chain data yet. Run <code>pinsight fetch-chain SPY</code> or wait for the morning launchd job.</div>`);
       return;
     }
     const haveFull = full && full.status === "ok";
@@ -827,7 +985,7 @@ async function renderPSChain() {
       drawVolByStrikeChart("volStrikeChart", full);
     }
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -924,7 +1082,7 @@ async function renderPSFlags() {
   try {
     const d = await jget("/api/pinsight/flags?top=200");
     if (d.status !== "ok" || !d.items?.length) {
-      set(`<div class="muted">No flagged contracts.</div>`);
+      setSoft(`<div class="muted">No flagged contracts.</div>`);
       return;
     }
     const filtered = d.items.filter(r => {
@@ -1009,7 +1167,7 @@ async function renderPSFlags() {
       window._flagSearchTimer = setTimeout(() => renderPSFlags(), 250);
     });
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1061,23 +1219,22 @@ function drawVoiHistChart(canvasId, items) {
 
 async function renderDEPaper() {
   try {
-    const baseFetches = [
+    const [d, eq, risk] = await Promise.all([
       jget("/api/driftedge/paper"),
       jget("/api/driftedge/paper/equity-history"),
       jget("/api/driftedge/paper/risk-stats"),
-    ];
-    const distFetches = ALL_TRADERS.map(t =>
-      jget(`/api/driftedge/paper/pnl-distribution?trader=${t}`));
-    const results = await Promise.all([...baseFetches, ...distFetches]);
-    const [d, eq, risk] = results;
-    const distArr = results.slice(3);
-    const dists = Object.fromEntries(ALL_TRADERS.map((t, i) => [t, distArr[i]]));
+    ]);
     if (d.status !== "ok") {
-      set(`<div class="muted">No paper trades yet.</div>`);
+      setSoft(`<div class="muted">No paper trades yet.</div>`);
       return;
     }
+    // Roster first, then the per-trader distribution fetches follow it.
+    updateRoster(eq, d);
+    const distArr = await Promise.all(ROSTER.map(t =>
+      jget(`/api/driftedge/paper/pnl-distribution?trader=${t}`)));
+    const dists = Object.fromEntries(ROSTER.map((t, i) => [t, distArr[i]]));
     const s = d.summary;
-    const TRADERS = ALL_TRADERS;
+    const TRADERS = ROSTER;
 
     const traderCards = TRADERS.map(t => {
       const x = s.by_trader?.[t] || {};
@@ -1086,8 +1243,8 @@ async function renderDEPaper() {
       const pnlClass = signClass(x.closed_pnl);
       const ddClass = (x.drawdown_pct ?? 0) > 5 ? "neg" : "muted";
       return `<div class="card">
-        <div class="card-title" style="color:${TRADER_COLORS[t]}">${TRADER_LABELS[t]}</div>
-        <div class="muted mono" style="font-size:10px;margin-bottom:6px">${TRADER_DESC[t]}</div>
+        <div class="card-title" style="color:${traderColor(t)}">${traderLabel(t)}</div>
+        <div class="muted mono" style="font-size:10px;margin-bottom:6px">${traderDesc(t)}</div>
         <div class="kpi-value mono ${retClass}">${ret != null ? signFmt(ret, 3) + "%" : "—"}</div>
         <div class="muted mono" style="font-size:10px;margin-top:4px">Total return</div>
         <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-family:var(--mono);font-size:11px">
@@ -1133,10 +1290,10 @@ async function renderDEPaper() {
     }).join("");
 
     set(`
-      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px">${traderCards}</div>
+      <div style="display:grid;grid-template-columns:repeat(${ROSTER.length},1fr);gap:12px;margin-bottom:16px">${traderCards}</div>
 
       <div class="card" style="margin-bottom:16px">
-        <div class="card-title">PORTFOLIO VALUE · 4-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(cash + MTM market value of open positions — updates every tick)</span></div>
+        <div class="card-title">PORTFOLIO VALUE · ${ROSTER.length}-TRADER HORSE RACE <span class="muted" style="font-weight:normal;font-size:10px">(cash + MTM market value of open positions — updates every tick)</span></div>
         <div class="chart-wrap tall"><canvas id="paperPortfolioChart"></canvas></div>
       </div>
 
@@ -1156,12 +1313,12 @@ async function renderDEPaper() {
         <div class="muted mono" style="font-size:10px;margin-bottom:8px;letter-spacing:0.06em">
           P&amp;L DISTRIBUTION PER TRADER <span style="color:#444">(realized closed trades — normality / fat tails)</span>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px">
-          ${ALL_TRADERS.map(t => `
-            <div class="card" style="border-top:2px solid ${TRADER_COLORS[t]};padding:12px">
-              <div style="color:${TRADER_COLORS[t]};font-family:var(--mono);font-size:11px;
+        <div style="display:grid;grid-template-columns:repeat(${ROSTER.length},1fr);gap:12px">
+          ${ROSTER.map(t => `
+            <div class="card" style="border-top:2px solid ${traderColor(t)};padding:12px">
+              <div style="color:${traderColor(t)};font-family:var(--mono);font-size:11px;
                           font-weight:bold;letter-spacing:0.06em;margin-bottom:6px">
-                ${TRADER_LABELS[t]}
+                ${traderLabel(t)}
               </div>
               ${renderDistMeta(dists[t])}
               <div class="chart-wrap"><canvas id="distChart_${t}"></canvas></div>
@@ -1195,7 +1352,7 @@ async function renderDEPaper() {
             <th class="r">Tgt</th><th class="r">Stop</th><th>Opened</th>
           </tr></thead>
           <tbody>${d.open.map(r => `<tr data-venue="${r.venue}" data-market-id="${r.market_id}" class="clickable-row">
-            <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
+            <td style="color:${traderColor(r.trader)}">${(r.trader || '—').toUpperCase()}</td>
             <td class="muted" style="font-size:10px">${r.venue}</td>
             <td class="ell" style="max-width:240px">${r.question ?? ''}</td>
             <td class="r amber">${fmt(r.entry_price, 3)}</td>
@@ -1244,7 +1401,7 @@ async function renderDEPaper() {
           <tbody>${d.closed.map(r => {
             const cls = signClass(r.pnl_usd);
             return `<tr data-venue="${r.venue}" data-market-id="${r.market_id}" class="clickable-row">
-              <td style="color:${TRADER_COLORS[r.trader]}">${(r.trader || '—').toUpperCase()}</td>
+              <td style="color:${traderColor(r.trader)}">${(r.trader || '—').toUpperCase()}</td>
               <td class="muted" style="font-size:10px">${r.venue}</td>
               <td class="muted" style="font-size:10px">${(r.category || '—').toUpperCase()}</td>
               <td class="ell" style="max-width:220px">${r.question ?? ''}</td>
@@ -1269,11 +1426,11 @@ async function renderDEPaper() {
 
     drawPortfolioChart("paperPortfolioChart", eq);
     drawEquityChart("paperEquityChart", eq);
-    for (const t of ALL_TRADERS) {
-      drawHistogramChart(`distChart_${t}`, dists[t], TRADER_COLORS[t]);
+    for (const t of ROSTER) {
+      drawHistogramChart(`distChart_${t}`, dists[t], traderColor(t));
     }
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1281,17 +1438,17 @@ function renderRiskPanel(risk) {
   if (!risk || risk.status !== "ok") {
     return '<div class="muted">No risk-history yet — needs a few ticks of paper engine activity.</div>';
   }
-  return `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px">
-    ${ALL_TRADERS.map(t => {
+  return `<div style="display:grid;grid-template-columns:repeat(${ROSTER.length},1fr);gap:12px">
+    ${ROSTER.map(t => {
       const r = risk.by_trader[t] || {};
       const retCls = signClass(r.total_return_pct);
       const ddCls = (r.max_drawdown_pct ?? 0) > 5 ? "neg" : "muted";
       const sharpe = r.sharpe;
       const sharpeCls = sharpe == null ? "muted" : (sharpe > 0 ? "pos" : "neg");
-      return `<div class="card" style="border-top:2px solid ${TRADER_COLORS[t]};padding:12px">
-        <div style="color:${TRADER_COLORS[t]};font-family:var(--mono);font-size:11px;
+      return `<div class="card" style="border-top:2px solid ${traderColor(t)};padding:12px">
+        <div style="color:${traderColor(t)};font-family:var(--mono);font-size:11px;
                     font-weight:bold;letter-spacing:0.06em;margin-bottom:8px">
-          ${TRADER_LABELS[t]}
+          ${traderLabel(t)}
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;
                     font-family:var(--mono);font-size:11px">
@@ -1339,7 +1496,7 @@ async function renderDEMarkets() {
       jget("/api/driftedge/price-distribution"),
     ]);
     if (d.status !== "ok") {
-      set(`<div class="muted">No DriftEdge data yet.</div>`);
+      setSoft(`<div class="muted">No DriftEdge data yet.</div>`);
       return;
     }
     set(`
@@ -1391,7 +1548,7 @@ async function renderDEMarkets() {
       });
     }
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1399,7 +1556,7 @@ async function renderDEBooks() {
   try {
     const d = await jget("/api/driftedge/books");
     if (d.status !== "ok" || !d.items?.length) {
-      set(`<div class="muted">No orderbook snapshots yet.</div>`);
+      setSoft(`<div class="muted">No orderbook snapshots yet.</div>`);
       return;
     }
     set(`
@@ -1423,7 +1580,7 @@ async function renderDEBooks() {
         </tbody>
       </table>`);
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1431,7 +1588,7 @@ async function renderSEHealth() {
   try {
     const h = await jget("/api/sentinel/health");
     if (h.status !== "ok") {
-      set(`<div class="neg">Health endpoint returned ${h.status}</div>`);
+      setSoft(`<div class="neg">Health endpoint returned ${h.status}</div>`);
       return;
     }
     const statusPill = (loaded, pid) => {
@@ -1447,10 +1604,11 @@ async function renderSEHealth() {
         <div class="card">
           <div class="card-title">PINSIGHT</div>
           <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
+            <div>Poll: ${ps.launchd.poll ? statusPill(ps.launchd.poll.loaded, ps.launchd.poll.pid) : '<span class="muted">—</span>'}</div>
             <div>Morning: ${statusPill(ps.launchd.morning.loaded, ps.launchd.morning.pid)}</div>
             <div>Midday: ${statusPill(ps.launchd.midday.loaded, ps.launchd.midday.pid)}</div>
             <div>Close: ${statusPill(ps.launchd.close.loaded, ps.launchd.close.pid)}</div>
-            <div style="margin-top:8px"><span class="muted">Data:</span> ${ps.data_size_mb} MB</div>
+            <div style="margin-top:8px"><span class="muted">Data:</span> ${ps.data_size_mb ?? "—"} MB</div>
             <div><span class="muted">Logs today:</span> ${ps.log_size_today_mb} MB</div>
           </div>
         </div>
@@ -1458,7 +1616,7 @@ async function renderSEHealth() {
           <div class="card-title">DRIFTEDGE</div>
           <div style="font-family:var(--mono);font-size:11px;line-height:1.8">
             <div>Poll: ${statusPill(de.launchd.poll.loaded, de.launchd.poll.pid)}</div>
-            <div style="margin-top:8px"><span class="muted">Data:</span> ${de.data_size_mb} MB</div>
+            <div style="margin-top:8px"><span class="muted">Data:</span> ${de.data_size_mb ?? "—"} MB</div>
             <div><span class="muted">Logs today:</span> ${de.log_size_today_mb} MB</div>
           </div>
         </div>
@@ -1482,7 +1640,7 @@ async function renderSEHealth() {
     const html = events.map(_fmtLogRow).join("");
     document.getElementById("recentLogs").innerHTML = html || '<span class="muted">No events.</span>';
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1513,13 +1671,13 @@ async function renderLogs(source) {
     const d = await jget(`/api/logs/${source}?max_lines=300`);
     const events = (d.events ?? []).reverse();
     if (!events.length) {
-      set(`<div class="muted">No log events today for ${source}.</div>`);
+      setSoft(`<div class="muted">No log events today for ${source}.</div>`);
       return;
     }
     const html = events.map(_fmtLogRow).join("");
     set(`<div class="card"><div style="padding:4px 0">${html}</div></div>`);
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1535,7 +1693,7 @@ async function renderDENews() {
     qs.set("limit", "300");
     const d = await jget("/api/driftedge/news?" + qs.toString());
     if (d.status !== "ok") {
-      set(`<div class="muted">No news yet. Run <code>driftedge fetch-news</code> or wait for the daemon's 15-minute sweep.</div>`);
+      setSoft(`<div class="muted">No news yet. Run <code>driftedge fetch-news</code> or wait for the daemon's 15-minute sweep.</div>`);
       return;
     }
     const sG = d.stats_global || d.stats || {};
@@ -1613,7 +1771,7 @@ async function renderDENews() {
       });
     });
   } catch (e) {
-    set(`<div class="neg">Error: ${e.message}</div>`);
+    renderError(e);
   }
 }
 
@@ -1731,7 +1889,7 @@ async function openMarketDetail(venue, marketId) {
             <tbody>${d.trades.map(t => {
               const cls = signClass(t.pnl_usd);
               return `<tr>
-                <td style="color:${TRADER_COLORS[t.trader] || 'var(--text)'}">${(t.trader || '—').toUpperCase()}</td>
+                <td style="color:${traderColor(t.trader) || 'var(--text)'}">${(t.trader || '—').toUpperCase()}</td>
                 <td class="muted" style="font-size:10px">${fmtTsLocal(t.entry_ts)}</td>
                 <td class="r">${fmt(t.entry_price, 3)}</td>
                 <td class="muted" style="font-size:10px">${fmtTsLocal(t.exit_ts)}</td>

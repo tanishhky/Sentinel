@@ -30,6 +30,20 @@ a:hover { color: var(--primary-2); }
 .header { display: flex; align-items: center; padding: 8px 16px; background: var(--bg-2); border-bottom: 1px solid var(--border-2); gap: 16px; }
 .brand { font-family: var(--mono); font-weight: 700; font-size: 14px; color: var(--primary); letter-spacing: 0.05em; }
 
+/* ── Header status lights ── */
+.status-cluster { display: flex; gap: 14px; align-items: center; font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em; }
+.status-item { display: flex; gap: 5px; align-items: center; color: var(--muted); cursor: default; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #444; display: inline-block; flex-shrink: 0; }
+.dot.live { background: var(--positive); box-shadow: 0 0 6px var(--positive); animation: dot-pulse 2s ease-in-out infinite; }
+.dot.idle { background: var(--primary); box-shadow: 0 0 4px rgba(255, 144, 0, 0.5); }
+.dot.error { background: var(--negative); box-shadow: 0 0 6px var(--negative); animation: dot-pulse 1s ease-in-out infinite; }
+.dot.stopped { background: var(--negative); opacity: 0.7; }
+.dot.unknown { background: #444; }
+@keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+.status-upd { color: var(--muted); font-family: var(--mono); font-size: 10px; }
+
+.conn-banner { background: rgba(255, 68, 68, 0.12); border-bottom: 1px solid var(--negative); color: var(--negative); font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; padding: 5px 16px; text-align: center; }
+
 .tabs { display: flex; background: var(--bg-2); border-bottom: 1px solid var(--border-2); padding: 0 8px; }
 .tab { padding: 10px 24px; background: transparent; border: none; color: var(--muted); font-family: var(--mono); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; cursor: pointer; border-bottom: 3px solid transparent; transition: color 120ms, border-color 120ms; }
 .tab:hover { color: var(--text); }

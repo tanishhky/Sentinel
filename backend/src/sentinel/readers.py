@@ -4,11 +4,85 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+
+
+# ---------- Caches ----------
+# The frontend polls every 5 s but most files only change every 60-300 s.
+# Parquet re-parsing (and, worse, the same file parsed 6x for the PAPER tab)
+# was the dominant per-tick cost, so hot files are cached keyed by mtime.
+# IMPORTANT: cached frames are shared across requests. Callers must never
+# mutate the returned DataFrame in place (filter/sort/copy are all fine,
+# they return new objects).
+
+_PQ_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_PQ_CACHE_MAX = 32
+
+
+def _read_pq(path: Path) -> pd.DataFrame:
+    key = str(path)
+    mtime = path.stat().st_mtime
+    hit = _PQ_CACHE.get(key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    df = pd.read_parquet(path)
+    if len(_PQ_CACHE) >= _PQ_CACHE_MAX:
+        _PQ_CACHE.pop(next(iter(_PQ_CACHE)))
+    _PQ_CACHE[key] = (mtime, df)
+    return df
+
+
+_TTL_CACHE: dict[str, tuple[float, Any]] = {}
+
+# Result memo keyed by a signature (usually source-file mtimes): the value
+# is recomputed only when the signature changes, so a payload that took
+# 100-200 ms to assemble is served instantly for every poll tick in between.
+_MEMO: dict[str, tuple[Any, Any]] = {}
+
+
+def _memo(key: str, sig: Any, fn):
+    hit = _MEMO.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    val = fn()
+    _MEMO[key] = (sig, val)
+    return val
+
+
+def _mt(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _ttl(key: str, ttl_s: float, fn):
+    now = time.time()
+    hit = _TTL_CACHE.get(key)
+    if hit is not None and now - hit[0] < ttl_s:
+        return hit[1]
+    val = fn()
+    _TTL_CACHE[key] = (now, val)
+    return val
+
+
+def _stride(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
+    """Downsample a time-ordered frame to <= max_points rows, always
+    keeping the final row so the chart's right edge is current."""
+    n = len(df)
+    if max_points <= 0 or n <= max_points:
+        return df
+    step = -(-n // max_points)  # ceil
+    idx = list(range(0, n, step))
+    if idx[-1] != n - 1:
+        idx.append(n - 1)
+    return df.iloc[idx]
 
 
 def _latest_file(dir_: Path, pattern: str = "*.parquet") -> Optional[Path]:
@@ -42,7 +116,7 @@ def pinsight_latest_chain(data_dir: Path) -> dict[str, Any]:
     if latest_path is None:
         return {"status": "no_data", "reason": "no chain parquets"}
 
-    df = pd.read_parquet(latest_path)
+    df = _read_pq(latest_path)
     if "_snapshot_ts" in df.columns:
         latest_ts = df["_snapshot_ts"].max()
         df = df[df["_snapshot_ts"] == latest_ts]
@@ -69,6 +143,13 @@ def pinsight_latest_chain(data_dir: Path) -> dict[str, Any]:
 
 
 def pinsight_paper(data_dir: Path) -> dict[str, Any]:
+    sig = (_mt(data_dir / "paper_trades.parquet"),
+           _mt(data_dir / "paper_state.parquet"))
+    return _memo(f"ps_paper:{data_dir}", sig,
+                 lambda: _pinsight_paper(data_dir))
+
+
+def _pinsight_paper(data_dir: Path) -> dict[str, Any]:
     """PinSight paper trader state + positions (same shape as DriftEdge).
 
     Schema-tolerant: supports the post-2026-06-03 cost-aware schema
@@ -81,7 +162,7 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
     if not trades_path.exists():
         return {"status": "no_data"}
     try:
-        df = pd.read_parquet(trades_path)
+        df = _read_pq(trades_path)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
@@ -114,7 +195,7 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
     state: dict[str, Any] = {}
     if state_path.exists():
         try:
-            st = pd.read_parquet(state_path)
+            st = _read_pq(state_path)
             for _, r in st.iterrows():
                 peak = _f(_pick(r, "peak_market_equity", "peak_equity"), 0.0)
                 # Prefer the explicit current_market_equity column;
@@ -193,7 +274,8 @@ def pinsight_paper(data_dir: Path) -> dict[str, Any]:
     }
 
 
-def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
+def pinsight_paper_equity_history(data_dir: Path,
+                                   max_points: int = 800) -> dict[str, Any]:
     """Schema-tolerant: prefer total_equity_market_usd (post-2026-06-03
     cost-aware schema) and fall back to total_equity_usd (legacy).
 
@@ -205,7 +287,7 @@ def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
     if not eq_path.exists():
         return {"status": "no_data"}
     try:
-        df = pd.read_parquet(eq_path)
+        df = _read_pq(eq_path)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
@@ -243,7 +325,7 @@ def pinsight_paper_equity_history(data_dir: Path) -> dict[str, Any]:
     series: dict[str, list[dict]] = {}
     dropped = 0
     for trader, grp in df.groupby("trader"):
-        grp = grp.sort_values("ts")
+        grp = _stride(grp.sort_values("ts"), max_points)
         rows: list[dict] = []
         last_good_equity: Optional[float] = None
         for _, r in grp.iterrows():
@@ -296,7 +378,7 @@ def pinsight_chain_full(data_dir: Path, top_contracts: int = 30) -> dict[str, An
     if latest_path is None:
         return {"status": "no_data"}
 
-    df = pd.read_parquet(latest_path)
+    df = _read_pq(latest_path)
     if "_snapshot_ts" in df.columns:
         df = df[df["_snapshot_ts"] == df["_snapshot_ts"].max()]
     if df.empty:
@@ -373,10 +455,30 @@ def pinsight_chain_full(data_dir: Path, top_contracts: int = 30) -> dict[str, An
     }
 
 
+_FLAGS_CACHE: dict[str, tuple[tuple, list[dict]]] = {}
+
+
 def pinsight_flagged_contracts(data_dir: Path, top: int = 20) -> dict[str, Any]:
     chains_root = data_dir / "chains"
     if not chains_root.exists():
         return {"status": "no_data"}
+
+    # Recompute only when some chain file actually changed. This endpoint
+    # otherwise re-parses every expiry parquet for every symbol on each
+    # 5-second poll.
+    files: list[tuple[Path, float]] = []
+    for symbol_dir in chains_root.iterdir():
+        if symbol_dir.is_dir():
+            for p in symbol_dir.glob("*.parquet"):
+                try:
+                    files.append((p, p.stat().st_mtime))
+                except OSError:
+                    pass
+    sig = tuple(sorted((str(p), m) for p, m in files))
+    cached = _FLAGS_CACHE.get(str(chains_root))
+    if cached is not None and cached[0] == sig:
+        rows = cached[1]
+        return {"status": "ok", "count": len(rows), "items": rows[:top]}
 
     rows: list[dict] = []
     for symbol_dir in chains_root.iterdir():
@@ -408,6 +510,7 @@ def pinsight_flagged_contracts(data_dir: Path, top: int = 20) -> dict[str, Any]:
                     "iv": round(float(r["iv"]), 4) if pd.notna(r.get("iv")) else None,
                 })
     rows.sort(key=lambda r: r["v_over_oi"], reverse=True)
+    _FLAGS_CACHE[str(chains_root)] = (sig, rows)
     return {"status": "ok", "count": len(rows), "items": rows[:top]}
 
 
@@ -420,7 +523,7 @@ def driftedge_top_markets(data_dir: Path, top: int = 30) -> dict[str, Any]:
     p = _latest_file(markets_root)
     if p is None:
         return {"status": "no_data"}
-    df = pd.read_parquet(p)
+    df = _read_pq(p)
     if "_snapshot_ts" in df.columns:
         df = df[df["_snapshot_ts"] == df["_snapshot_ts"].max()]
     df = df.sort_values("volume_24h", ascending=False).head(top)
@@ -445,6 +548,14 @@ def driftedge_top_markets(data_dir: Path, top: int = 30) -> dict[str, Any]:
 
 
 def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
+    sig = (_mt(data_dir / "paper_trades.parquet"),
+           _mt(data_dir / "paper_state.parquet"),
+           _mt(data_dir / "equity_history.parquet"))
+    return _memo(f"de_paper:{data_dir}", sig,
+                 lambda: _driftedge_paper_trades(data_dir))
+
+
+def _driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
     """Read paper_trades.parquet + paper_state.parquet and return a
     multi-trader summary."""
     trades_path = data_dir / "paper_trades.parquet"
@@ -452,7 +563,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
     if not trades_path.exists():
         return {"status": "no_data"}
     try:
-        df = pd.read_parquet(trades_path)
+        df = _read_pq(trades_path)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
@@ -462,7 +573,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
     state_by_trader: dict[str, dict[str, Any]] = {}
     if state_path.exists():
         try:
-            st = pd.read_parquet(state_path)
+            st = _read_pq(state_path)
             for _, r in st.iterrows():
                 state_by_trader[str(r["trader"])] = {
                     "bankroll_init": float(r["bankroll_init"]),
@@ -489,7 +600,7 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
     mtm_equity_by_trader: dict[str, float] = {}
     if equity_path.exists():
         try:
-            eq = pd.read_parquet(equity_path)
+            eq = _read_pq(equity_path)
             if not eq.empty and "trader" in eq.columns and "ts" in eq.columns:
                 eq = eq.sort_values("ts")
                 # Prefer the new MTM column; fall back to legacy name.
@@ -645,7 +756,17 @@ def driftedge_paper_trades(data_dir: Path) -> dict[str, Any]:
     }
 
 
-def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
+def driftedge_equity_history(data_dir: Path,
+                             max_points: int = 800) -> dict[str, Any]:
+    sig = (_mt(data_dir / "equity_history.parquet"),
+           _mt(data_dir / "paper_trades.parquet"),
+           _mt(data_dir / "paper_state.parquet"), max_points)
+    return _memo(f"de_equity:{data_dir}", sig,
+                 lambda: _driftedge_equity_history(data_dir, max_points))
+
+
+def _driftedge_equity_history(data_dir: Path,
+                              max_points: int = 800) -> dict[str, Any]:
     """Per-trader equity time series.
 
     Primary source: ``equity_history.parquet`` (continuous MTM written every
@@ -658,14 +779,14 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
     # ── Primary path: continuous MTM file written by paper.tick ──
     if equity_path.exists():
         try:
-            edf = pd.read_parquet(equity_path)
+            edf = _read_pq(equity_path)
         except Exception as exc:
             return {"status": "error", "err": str(exc)}
         if not edf.empty and "trader" in edf.columns:
             bankrolls: dict[str, float] = {}
             if state_path.exists():
                 try:
-                    st = pd.read_parquet(state_path)
+                    st = _read_pq(state_path)
                     for _, r in st.iterrows():
                         bankrolls[str(r["trader"])] = float(r["bankroll_init"])
                 except Exception:
@@ -681,7 +802,7 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
             trades_path = data_dir / "paper_trades.parquet"
             if trades_path.exists():
                 try:
-                    tdf = pd.read_parquet(trades_path)
+                    tdf = _read_pq(trades_path)
                     closed_tdf = tdf[
                         (tdf["status"] != "open") & tdf["exit_ts"].notna()
                     ].copy()
@@ -712,9 +833,25 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
                 idx = _bisect.bisect_right([p[0] for p in lookup], ep) - 1
                 return lookup[idx][1] if idx >= 0 else 0.0
 
+            # Active roster: traders still writing equity rows. Retired
+            # traders (volwt, resolution — 2026-07-04) keep their history
+            # here but stop getting new snapshots, so recency vs the
+            # newest row separates active from retired without Sentinel
+            # hardcoding engine roster names. Relative-to-newest (not
+            # wall clock) so a daemon outage never empties the roster;
+            # all active traders write within the same tick, so 2 h is
+            # generous.
+            last_ts_by_trader: dict[str, Any] = {}
+            for trader, grp in edf.groupby("trader"):
+                last_ts_by_trader[str(trader)] = pd.Timestamp(grp["ts"].max())
+            newest = max(last_ts_by_trader.values())
+            active_traders = sorted(
+                t for t, ts in last_ts_by_trader.items()
+                if (newest - ts).total_seconds() <= 2 * 3600)
+
             series: dict[str, list[dict[str, Any]]] = {}
             for trader, grp in edf.groupby("trader"):
-                grp = grp.sort_values("ts")
+                grp = _stride(grp.sort_values("ts"), max_points)
                 lookup = cum_dep_lookups.get(str(trader), [])
                 series[str(trader)] = [
                     {"ts": str(r["ts"]),
@@ -728,9 +865,8 @@ def driftedge_equity_history(data_dir: Path) -> dict[str, Any]:
                     for _, r in grp.iterrows()
                 ]
             return {"status": "ok", "series": series,
-                    "bankrolls": bankrolls or {"kelly": 10000, "equal": 10000,
-                                               "volwt": 10000, "volharvest": 10000,
-                                               "resolution": 10000},
+                    "active_traders": active_traders,
+                    "bankrolls": bankrolls,
                     "source": "equity_history"}
 
     # ── Fallback: reconstruct from trades when no equity_history yet ──
@@ -823,7 +959,7 @@ def driftedge_price_distribution(data_dir: Path) -> dict[str, Any]:
     p = _latest_file(markets_root) if markets_root.exists() else None
     if p is None:
         return {"status": "no_data"}
-    df = pd.read_parquet(p)
+    df = _read_pq(p)
     if "_snapshot_ts" in df.columns:
         df = df[df["_snapshot_ts"] == df["_snapshot_ts"].max()]
     prices = df["yes_price"].dropna().tolist()
@@ -842,39 +978,80 @@ def driftedge_price_distribution(data_dir: Path) -> dict[str, Any]:
     }
 
 
-def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
-                    driftedge_data: Path, driftedge_logs: Path,
-                    sentinel_logs: Path) -> dict[str, Any]:
-    """System-wide health snapshot."""
+def _dir_size_mb(d: Path) -> float:
+    """Walks the whole tree — expensive on the book archive, so callers
+    must go through the TTL cache (_dir_size_mb_cached)."""
+    if not d.exists():
+        return 0.0
+    total = 0
+    for root, _, files in os.walk(d):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return round(total / 1024 / 1024, 2)
 
-    def _dir_size_mb(d: Path) -> float:
-        if not d.exists():
-            return 0.0
-        total = 0
-        for root, _, files in os.walk(d):
-            for f in files:
-                try:
-                    total += os.path.getsize(os.path.join(root, f))
-                except OSError:
-                    pass
-        return round(total / 1024 / 1024, 2)
 
-    def _launchd_status(label: str) -> dict[str, Any]:
+def _dir_size_mb_cached(d: Path, ttl_s: float = 300.0) -> Optional[float]:
+    """Stale-while-revalidate: the walk takes seconds on the book archive
+    and must never block a polled endpoint. Serves the last known value
+    (None before the first walk finishes) and refreshes in a daemon
+    thread when the TTL lapses."""
+    key = f"dirsize:{d}"
+    now = time.time()
+    hit = _TTL_CACHE.get(key)
+    if hit is not None and now - hit[0] < ttl_s:
+        return hit[1]
+    flag = key + ":refreshing"
+    if not _TTL_CACHE.get(flag, (0, False))[1]:
+        _TTL_CACHE[flag] = (now, True)
+
+        def _worker():
+            try:
+                _TTL_CACHE[key] = (time.time(), _dir_size_mb(d))
+            finally:
+                _TTL_CACHE[flag] = (time.time(), False)
+
+        threading.Thread(target=_worker, daemon=True).start()
+    return hit[1] if hit is not None else None
+
+
+def _launchd_jobs() -> dict[str, dict[str, Any]]:
+    """One `launchctl list` call, parsed for every com.tanishk.* job.
+    TTL-cached so polling endpoints don't spawn a subprocess per label."""
+    def _load() -> dict[str, dict[str, Any]]:
+        jobs: dict[str, dict[str, Any]] = {}
         try:
             out = subprocess.check_output(
                 ["launchctl", "list"], text=True, timeout=3)
             for line in out.splitlines():
-                if label in line:
-                    parts = line.split("\t")
-                    pid_s = parts[0] if parts else "-"
-                    exit_s = parts[1] if len(parts) > 1 else "-"
-                    return {"loaded": True,
-                            "pid": None if pid_s == "-" else int(pid_s),
-                            "last_exit_code": int(exit_s) if exit_s.lstrip("-").isdigit() else None}
+                parts = line.split("\t")
+                if len(parts) >= 3 and "com.tanishk" in parts[2]:
+                    pid_s, exit_s, label = parts[0], parts[1], parts[2]
+                    jobs[label] = {
+                        "pid": None if pid_s == "-" else int(pid_s),
+                        "last_exit_code": (int(exit_s)
+                                           if exit_s.lstrip("-").isdigit()
+                                           else None),
+                    }
         except Exception:
             pass
-        return {"loaded": False, "pid": None, "last_exit_code": None}
+        return jobs
+    return _ttl("launchd", 5.0, _load)
 
+
+def _launchd_status(label: str) -> dict[str, Any]:
+    for job_label, info in _launchd_jobs().items():
+        if label in job_label:
+            return {"loaded": True, **info}
+    return {"loaded": False, "pid": None, "last_exit_code": None}
+
+
+def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
+                    driftedge_data: Path, driftedge_logs: Path,
+                    sentinel_logs: Path) -> dict[str, Any]:
+    """System-wide health snapshot."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
     def _today_log_size(log_dir: Path) -> float:
@@ -892,16 +1069,17 @@ def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
         "status": "ok",
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "pinsight": {
-            "data_size_mb": _dir_size_mb(pinsight_data),
+            "data_size_mb": _dir_size_mb_cached(pinsight_data),
             "log_size_today_mb": _today_log_size(pinsight_logs),
             "launchd": {
+                "poll": _launchd_status("com.tanishk.pinsight.poll"),
                 "morning": _launchd_status("com.tanishk.pinsight.morning"),
                 "midday": _launchd_status("com.tanishk.pinsight.midday"),
                 "close": _launchd_status("com.tanishk.pinsight.close"),
             },
         },
         "driftedge": {
-            "data_size_mb": _dir_size_mb(driftedge_data),
+            "data_size_mb": _dir_size_mb_cached(driftedge_data),
             "log_size_today_mb": _today_log_size(driftedge_logs),
             "launchd": {
                 "poll": _launchd_status("com.tanishk.driftedge.poll"),
@@ -912,6 +1090,89 @@ def sentinel_health(pinsight_data: Path, pinsight_logs: Path,
             "launchd": {
                 "server": _launchd_status("com.tanishk.sentinel"),
             },
+        },
+    }
+
+
+def engines_status(pinsight_data: Path, pinsight_logs: Path,
+                   driftedge_data: Path, driftedge_logs: Path) -> dict[str, Any]:
+    """Cheap liveness snapshot that drives the header status lights.
+
+    Freshness = newest mtime among each engine's heartbeat files (equity
+    history, paper trades, today's structured logs). No parquet is parsed
+    and no directory tree is walked, so this is safe to poll every 5 s.
+
+    States:
+      live    — activity within live_s (green)
+      idle    — loaded, last activity within stale_s (amber; normal for
+                PinSight outside market hours)
+      error   — loaded but silent way past normal cadence, or last exit
+                code nonzero with no fresh data (red)
+      stopped — launchd job(s) not loaded at all (red)
+    """
+    now = time.time()
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _newest(data_dir: Path, log_dir: Path) -> float:
+        best = max(_mtime(data_dir / "equity_history.parquet"),
+                   _mtime(data_dir / "paper_trades.parquet"))
+        if log_dir.exists():
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            for p in log_dir.glob(f"*-{today}.jsonl"):
+                best = max(best, _mtime(p))
+        return best
+
+    def _engine(data_dir: Path, log_dir: Path, labels: dict[str, str],
+                live_s: float, stale_s: float) -> dict[str, Any]:
+        last = _newest(data_dir, log_dir)
+        jobs = {name: _launchd_status(lbl) for name, lbl in labels.items()}
+        loaded = any(j["loaded"] for j in jobs.values())
+        running = any(j["pid"] for j in jobs.values())
+        bad_exit = any(j["loaded"] and j["pid"] is None
+                       and (j["last_exit_code"] or 0) != 0
+                       for j in jobs.values())
+        age = (now - last) if last else None
+        if not loaded:
+            state = "stopped"
+        elif age is not None and age <= live_s:
+            state = "live"
+        elif bad_exit:
+            state = "error"
+        elif age is not None and age <= stale_s:
+            state = "idle"
+        else:
+            state = "error"
+        return {
+            "state": state,
+            "running": running,
+            "last_activity_ts": (
+                datetime.fromtimestamp(last, tz=timezone.utc)
+                .isoformat(timespec="seconds") if last else None),
+            "age_s": round(age) if age is not None else None,
+            "launchd": jobs,
+            "data_size_mb": _dir_size_mb_cached(data_dir),
+        }
+
+    return {
+        "status": "ok",
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "engines": {
+            "pinsight": _engine(
+                pinsight_data, pinsight_logs,
+                {"poll": "com.tanishk.pinsight.poll",
+                 "morning": "com.tanishk.pinsight.morning",
+                 "midday": "com.tanishk.pinsight.midday",
+                 "close": "com.tanishk.pinsight.close"},
+                live_s=15 * 60, stale_s=20 * 3600),
+            "driftedge": _engine(
+                driftedge_data, driftedge_logs,
+                {"poll": "com.tanishk.driftedge.poll"},
+                live_s=15 * 60, stale_s=2 * 3600),
         },
     }
 
@@ -1004,7 +1265,7 @@ def driftedge_review_queue(data_dir: Path) -> dict[str, Any]:
     if not p.exists():
         return {"status": "no_data", "items": [], "stats": {}}
     try:
-        df = pd.read_parquet(p)
+        df = _read_pq(p)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
@@ -1079,7 +1340,7 @@ def driftedge_news(data_dir: Path, *, category: Optional[str] = None,
     dfs = []
     for p in files:
         try:
-            dfs.append(pd.read_parquet(p))
+            dfs.append(_read_pq(p))
         except Exception:
             continue
     if not dfs:
@@ -1198,14 +1459,14 @@ def driftedge_risk_stats(data_dir: Path) -> dict[str, Any]:
     eq: pd.DataFrame = pd.DataFrame()
     if equity_path.exists():
         try:
-            eq = pd.read_parquet(equity_path)
+            eq = _read_pq(equity_path)
         except Exception:
             eq = pd.DataFrame()
 
     trades: pd.DataFrame = pd.DataFrame()
     if trades_path.exists():
         try:
-            trades = pd.read_parquet(trades_path)
+            trades = _read_pq(trades_path)
         except Exception:
             trades = pd.DataFrame()
 
@@ -1290,7 +1551,7 @@ def driftedge_pnl_distribution(data_dir: Path, *,
     if not trades_path.exists():
         return {"status": "no_data"}
     try:
-        df = pd.read_parquet(trades_path)
+        df = _read_pq(trades_path)
     except Exception as exc:
         return {"status": "error", "err": str(exc)}
     if df.empty:
@@ -1334,8 +1595,17 @@ def driftedge_pnl_distribution(data_dir: Path, *,
     }
 
 
+_BOOKS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def driftedge_active_books(data_dir: Path) -> dict[str, Any]:
-    """Count of orderbook Parquets per market — a liveness signal."""
+    """Count of orderbook Parquets per market — a liveness signal.
+
+    Per-market memo keyed by the latest file's mtime: the archive holds
+    hundreds of resolved markets whose books never change again, and
+    re-parsing all of them took ~5 s per poll. Only changed books are
+    re-read now.
+    """
     books_root = data_dir / "books" / "polymarket"
     if not books_root.exists():
         return {"status": "no_data"}
@@ -1347,18 +1617,25 @@ def driftedge_active_books(data_dir: Path) -> dict[str, Any]:
         if not files:
             continue
         latest = max(files, key=lambda p: p.stat().st_mtime)
+        mtime = latest.stat().st_mtime
+        hit = _BOOKS_CACHE.get(str(md))
+        if hit is not None and hit[0] == mtime:
+            markets.append(hit[1])
+            continue
         try:
             df = pd.read_parquet(latest)
             snapshot_count = df["snapshot_ts"].nunique() if "snapshot_ts" in df.columns else 0
             last_ts = df["snapshot_ts"].max() if "snapshot_ts" in df.columns else None
         except Exception:
             snapshot_count, last_ts = 0, None
-        markets.append({
+        entry = {
             "market_id": md.name[:20] + "...",
             "snapshot_count_today": int(snapshot_count),
             "last_snapshot_ts": str(last_ts) if last_ts else None,
-            "file_mtime": datetime.fromtimestamp(latest.stat().st_mtime).isoformat(),
-        })
+            "file_mtime": datetime.fromtimestamp(mtime).isoformat(),
+        }
+        _BOOKS_CACHE[str(md)] = (mtime, entry)
+        markets.append(entry)
     markets.sort(key=lambda m: m["file_mtime"] or "", reverse=True)
     return {"status": "ok", "count": len(markets), "items": markets[:30]}
 

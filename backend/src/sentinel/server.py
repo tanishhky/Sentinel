@@ -2,6 +2,7 @@
 
 Routes:
   GET  /api/health
+  GET  /api/status                engine liveness for header status lights
   GET  /api/pinsight/chain        latest chain snapshot summary
   GET  /api/pinsight/flags        flagged contracts (vol/OI >= 1)
   GET  /api/driftedge/markets     top markets by 24h volume
@@ -138,6 +139,14 @@ def create_app() -> FastAPI:
     @app.get("/api/driftedge/price-distribution")
     def driftedge_price_distribution():
         return readers.driftedge_price_distribution(c.driftedge_data)
+
+    @app.get("/api/status")
+    def api_status():
+        """Cheap engine liveness for the header status lights (5 s poll)."""
+        return readers.engines_status(
+            c.pinsight_data, c.pinsight_logs,
+            c.driftedge_data, c.driftedge_logs,
+        )
 
     @app.get("/api/sentinel/health")
     def sentinel_health_endpoint():

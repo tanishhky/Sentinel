@@ -60,13 +60,24 @@ user sees blank cards.
 - [ ] **`Optional[str]` audit**: there are still old `str | None` annotations
       on lesser-used readers; they will crash under Python 3.9 if FastAPI
       evaluates them. Sweep `readers.py` and `server.py`.
-- [ ] **CHAIN tab "Loading…" flash**: shows briefly on every 5-second tick.
-      Cache the last-rendered HTML and only redraw on data change.
-- [ ] **README endpoints table**: now stale (risk-stats + pnl-distribution
-      missing). Regenerate.
+- [ ] **README endpoints table**: now stale (risk-stats + pnl-distribution +
+      status missing). Regenerate.
 
 ## Done (recent)
 
+- [x] **Chart flash / "Loading…" tick fixed (2026-07-03)**: charts are now
+      destroyed only at the atomic content swap (after data is fetched),
+      chart animations off, fetch errors keep the last good view + show a
+      connection banner, refresh skips hidden tabs and never overlaps,
+      tab switches abort in-flight fetches.
+- [x] **Header status lights (2026-07-03)**: SENTINEL / PINSIGHT / DRIFTEDGE
+      dots (live/idle/error/stopped) + last-update stamp, driven by the new
+      cheap `GET /api/status` (file mtimes + one cached `launchctl list`,
+      no tree walks).
+- [x] **Backend lag fixes (2026-07-03)**: mtime-keyed parquet cache,
+      payload memoization for paper/equity readers, per-market books cache
+      (5.4 s → 0.08 s), flags cache, dir-size stale-while-revalidate.
+      Equity histories downsampled to ≤800 points per trader.
 - [x] Risk-stats panel + per-trader P&L histograms (Paper tab)
 - [x] Per-market P&L histogram in market detail modal
 - [x] CONTRACT-SPEC.md v1.0
